@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"gemini-tool/protocol"
 
 	"cloud.google.com/go/vertexai/genai"
 	"go.uber.org/zap"
@@ -57,10 +61,11 @@ func NewGeminiClient(ctx context.Context, projectID, location, credentialsPath s
 	model := client.GenerativeModel("gemini-2.5-pro")
 
 	// Configure model parameters
+	const geminiPro25MaxTokens = 65535
 	model.SetTemperature(0.7)
 	model.SetTopP(0.8)
 	model.SetTopK(40)
-	model.SetMaxOutputTokens(8192)
+	model.SetMaxOutputTokens(int32(geminiPro25MaxTokens))
 
 	// Setup tools
 	tools := setupTools(logger)
@@ -70,7 +75,7 @@ func NewGeminiClient(ctx context.Context, projectID, location, credentialsPath s
 		zap.Float32("temperature", 0.7),
 		zap.Float32("topP", 0.8),
 		zap.Int32("topK", 40),
-		zap.Int32("maxOutputTokens", 8192),
+		zap.Int32("maxOutputTokens", geminiPro25MaxTokens),
 		zap.Int("toolsCount", len(tools)))
 
 	return &GeminiClient{
@@ -90,8 +95,18 @@ func (gc *GeminiClient) GenerateContent(ctx context.Context, prompt string) (str
 		return "", fmt.Errorf("failed to generate content: %w", err)
 	}
 
+	// Store the full response to a file for debugging
+	err = gc.storeResponseToFile(resp, "gemini_response.txt")
+	if err != nil {
+		gc.logger.Warn("Failed to store response to file", zap.Error(err))
+	}
+
 	if len(resp.Candidates) == 0 {
 		gc.logger.Error("No response candidates returned")
+		err = gc.storeDebugInfo(resp, "no_candidates_debug.txt")
+		if err != nil {
+			gc.logger.Warn("Failed to store debug info", zap.Error(err))
+		}
 		return "", fmt.Errorf("no response candidates returned")
 	}
 
@@ -99,6 +114,10 @@ func (gc *GeminiClient) GenerateContent(ctx context.Context, prompt string) (str
 	candidate := resp.Candidates[0]
 	if candidate.Content == nil || len(candidate.Content.Parts) == 0 {
 		gc.logger.Error("No content in response")
+		err = gc.storeDebugInfo(resp, "no_content_debug.txt")
+		if err != nil {
+			gc.logger.Warn("Failed to store debug info", zap.Error(err))
+		}
 		return "", fmt.Errorf("no content in response")
 	}
 
@@ -107,11 +126,17 @@ func (gc *GeminiClient) GenerateContent(ctx context.Context, prompt string) (str
 		if funcCall, ok := part.(genai.FunctionCall); ok {
 			gc.logger.Info("Function call detected", zap.String("functionName", funcCall.Name))
 
-			// Create directory tool instance
+			// Create tool instances
 			dirTool := &DirectoryStructureTool{logger: gc.logger}
+			goplsTool, err := NewGoplsTool(gc.logger)
+			if err != nil {
+				gc.logger.Error("Failed to create gopls tool", zap.Error(err))
+				return "", fmt.Errorf("failed to create gopls tool: %w", err)
+			}
+			defer goplsTool.Close()
 
 			// Handle the function call
-			result, err := handleFunctionCall(&funcCall, dirTool, gc.logger)
+			result, err := handleFunctionCall(&funcCall, dirTool, goplsTool, gc.logger)
 			if err != nil {
 				gc.logger.Error("Failed to handle function call", zap.Error(err))
 				return "", fmt.Errorf("failed to handle function call: %w", err)
@@ -124,13 +149,36 @@ func (gc *GeminiClient) GenerateContent(ctx context.Context, prompt string) (str
 			}
 
 			// Continue the conversation with the function result and a text prompt
+			var followUpPrompt string
+			switch funcCall.Name {
+			case "analyze_go_code":
+				if actionParam, ok := funcCall.Args["action"].(string); ok {
+					switch actionParam {
+					case "code_definitions":
+						followUpPrompt = "Based on the code definitions provided, please analyze the code structure and help with generating appropriate unit tests."
+					default:
+						followUpPrompt = "Please analyze the Go code data provided by the function call and provide relevant insights."
+					}
+				} else {
+					followUpPrompt = "Please analyze the Go code data provided by the function call and provide relevant insights."
+				}
+			case "get_code_definitions":
+				followUpPrompt = "Based on the code definitions provided, please analyze the code structure and help with generating appropriate unit tests."
+			default:
+				followUpPrompt = "Please analyze the data provided by the function call and provide relevant insights."
+			}
+
 			resp2, err := gc.model.GenerateContent(ctx,
-				genai.Text("Please analyze the directory structure data provided by the function call and provide insights about the project."),
+				genai.Text(followUpPrompt),
 				functionResponse)
 			if err != nil {
 				gc.logger.Error("Failed to generate content after function call", zap.Error(err))
 				return "", fmt.Errorf("failed to generate content after function call: %w", err)
 			}
+
+			gc.logger.Info("Made second AI call with function response",
+				zap.String("followUpPrompt", followUpPrompt),
+				zap.String("functionName", funcCall.Name))
 
 			if len(resp2.Candidates) > 0 && resp2.Candidates[0].Content != nil && len(resp2.Candidates[0].Content.Parts) > 0 {
 				if textPart, ok := resp2.Candidates[0].Content.Parts[0].(genai.Text); ok {
@@ -232,42 +280,100 @@ func (dst *DirectoryStructureTool) walkDirectory(path, prefix string, currentDep
 
 // setupTools configures the tools for Gemini
 func setupTools(logger *zap.Logger) []*genai.Tool {
-	// Define the directory structure tool
-	directoryStructureTool := &genai.Tool{
+	// Define a single comprehensive code analysis tool
+	codeAnalysisTool := &genai.Tool{
 		FunctionDeclarations: []*genai.FunctionDeclaration{
 			{
-				Name:        "get_directory_structure",
-				Description: "Get the directory structure of a given path up to a specified depth",
+				Name:        "analyze_go_code",
+				Description: "Analyze Go code projects - get code definitions for symbols using gopls",
 				Parameters: &genai.Schema{
 					Type: genai.TypeObject,
 					Properties: map[string]*genai.Schema{
+						"action": {
+							Type:        genai.TypeString,
+							Description: "Action to perform: 'code_definitions'",
+							Enum:        []string{"code_definitions"}, // Only code_definitions for now
+						},
 						"path": {
 							Type:        genai.TypeString,
-							Description: "The directory path to analyze",
+							Description: "The file path to analyze",
 						},
-						"max_depth": {
-							Type:        genai.TypeInteger,
-							Description: "Maximum depth to traverse (default: 3)",
+						"symbols": {
+							Type: genai.TypeArray,
+							Items: &genai.Schema{
+								Type: genai.TypeString,
+							},
+							Description: "List of symbol names to look up for code definitions (function names, struct names, etc.)",
 						},
 					},
-					Required: []string{"path"},
+					Required: []string{"action", "path", "symbols"},
 				},
 			},
 		},
 	}
 
-	logger.Info("Configured tools for Gemini",
-		zap.Int("toolCount", len([]*genai.Tool{directoryStructureTool})))
+	tools := []*genai.Tool{codeAnalysisTool}
+	logger.Info("Configured tools for Gemini", zap.Int("toolCount", len(tools)))
 
-	return []*genai.Tool{directoryStructureTool}
+	return tools
 }
 
 // handleFunctionCall processes function calls from Gemini
-func handleFunctionCall(call *genai.FunctionCall, dirTool *DirectoryStructureTool, logger *zap.Logger) (string, error) {
+func handleFunctionCall(call *genai.FunctionCall, dirTool *DirectoryStructureTool, goplsTool *GoplsTool, logger *zap.Logger) (string, error) {
 	logger.Debug("Handling function call",
 		zap.String("functionName", call.Name))
 
 	switch call.Name {
+	case "analyze_go_code":
+		// Extract action parameter
+		actionParam, ok := call.Args["action"].(string)
+		if !ok {
+			return "", fmt.Errorf("action parameter is required and must be a string")
+		}
+
+		// Extract path parameter
+		pathParam, ok := call.Args["path"].(string)
+		if !ok {
+			return "", fmt.Errorf("path parameter is required and must be a string")
+		}
+
+		switch actionParam {
+		case "code_definitions":
+			// Extract symbols parameter
+			symbolsParam, ok := call.Args["symbols"].([]interface{})
+			if !ok {
+				return "", fmt.Errorf("symbols parameter is required and must be an array for code_definitions action")
+			}
+
+			// Convert interface{} slice to string slice
+			symbols := make([]string, len(symbolsParam))
+			for i, symbol := range symbolsParam {
+				if symbolStr, ok := symbol.(string); ok {
+					symbols[i] = symbolStr
+				} else {
+					return "", fmt.Errorf("symbol at index %d is not a string", i)
+				}
+			}
+
+			// Call the gopls tool
+			definitions, err := goplsTool.GetCodeDefinitions(pathParam, symbols)
+			if err != nil {
+				return "", fmt.Errorf("failed to get code definitions: %w", err)
+			}
+
+			logger.Info("Code definitions function executed successfully",
+				zap.String("functionName", call.Name),
+				zap.String("action", actionParam),
+				zap.String("filePath", pathParam),
+				zap.Strings("symbols", symbols))
+
+			return definitions, nil
+
+		default:
+			return "", fmt.Errorf("unknown action: %s", actionParam)
+		}
+
+	// Keep backward compatibility with old function names
 	case "get_directory_structure":
 		// Extract parameters
 		pathParam, ok := call.Args["path"].(string)
@@ -295,9 +401,307 @@ func handleFunctionCall(call *genai.FunctionCall, dirTool *DirectoryStructureToo
 
 		return structure, nil
 
+	case "get_code_definitions":
+		// Extract parameters
+		filePathParam, ok := call.Args["file_path"].(string)
+		if !ok {
+			return "", fmt.Errorf("file_path parameter is required and must be a string")
+		}
+
+		symbolsParam, ok := call.Args["symbols"].([]interface{})
+		if !ok {
+			return "", fmt.Errorf("symbols parameter is required and must be an array")
+		}
+
+		// Convert interface{} slice to string slice
+		symbols := make([]string, len(symbolsParam))
+		for i, symbol := range symbolsParam {
+			if symbolStr, ok := symbol.(string); ok {
+				symbols[i] = symbolStr
+			} else {
+				return "", fmt.Errorf("symbol at index %d is not a string", i)
+			}
+		}
+
+		// Call the gopls tool
+		definitions, err := goplsTool.GetCodeDefinitions(filePathParam, symbols)
+		if err != nil {
+			return "", fmt.Errorf("failed to get code definitions: %w", err)
+		}
+
+		logger.Info("Function call executed successfully",
+			zap.String("functionName", call.Name),
+			zap.String("filePath", filePathParam),
+			zap.Strings("symbols", symbols))
+
+		return definitions, nil
+
 	default:
 		return "", fmt.Errorf("unknown function: %s", call.Name)
 	}
+}
+
+// GoplsTool represents the gopls integration tool
+type GoplsTool struct {
+	logger      *zap.Logger
+	goplsClient *GoplsClient
+}
+
+// NewGoplsTool creates a new gopls tool instance
+func NewGoplsTool(logger *zap.Logger) (*GoplsTool, error) {
+	client, err := NewGoplsClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gopls client: %w", err)
+	}
+
+	return &GoplsTool{
+		logger:      logger,
+		goplsClient: client,
+	}, nil
+}
+
+// GetCodeDefinitions retrieves definitions for the requested symbols from gopls
+func (gt *GoplsTool) GetCodeDefinitions(filePath string, symbols []string) (string, error) {
+	gt.logger.Debug("Getting code definitions from gopls",
+		zap.String("filePath", filePath),
+		zap.Strings("symbols", symbols))
+
+	// Initialize gopls with the workspace
+	err := gt.initializeWorkspace(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to initialize workspace: %w", err)
+	}
+
+	var results strings.Builder
+	results.WriteString("Code Definitions:\n\n")
+
+	// Read the file content to find symbol positions
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read file: %w", err)
+	}
+
+	fileContent := string(content)
+
+	for _, symbol := range symbols {
+		gt.logger.Debug("Looking up symbol", zap.String("symbol", symbol))
+
+		// Find symbol position in the file
+		position := gt.findSymbolPosition(fileContent, symbol)
+		if position == nil {
+			results.WriteString(fmt.Sprintf("Symbol '%s': Not found in file\n", symbol))
+			continue
+		}
+
+		// Get definition from gopls
+		definition, err := gt.getDefinitionAtPosition(filePath, *position)
+		if err != nil {
+			gt.logger.Warn("Failed to get definition for symbol",
+				zap.String("symbol", symbol),
+				zap.Error(err))
+			results.WriteString(fmt.Sprintf("Symbol '%s': Error getting definition - %v\n", symbol, err))
+			continue
+		}
+
+		results.WriteString(fmt.Sprintf("Symbol '%s':\n", symbol))
+		results.WriteString(fmt.Sprintf("  Location: %s\n", definition.URI))
+		results.WriteString(fmt.Sprintf("  Line: %d, Character: %d\n",
+			definition.Range.Start.Line+1, definition.Range.Start.Character+1))
+
+		// Try to get the actual code content at the definition location
+		defContent, err := gt.getCodeAtLocation(definition)
+		if err == nil && defContent != "" {
+			results.WriteString(fmt.Sprintf("  Code:\n%s\n", defContent))
+		}
+		results.WriteString("\n")
+	}
+
+	result := results.String()
+	gt.logger.Info("Successfully retrieved code definitions",
+		zap.Int("symbolCount", len(symbols)),
+		zap.Int("resultLength", len(result)))
+
+	return result, nil
+}
+
+// initializeWorkspace initializes gopls with the workspace
+func (gt *GoplsTool) initializeWorkspace(filePath string) error {
+	// Initialize gopls if not already done
+	if !gt.goplsClient.initialized {
+		err := gt.goplsClient.Initialize()
+		if err != nil {
+			return fmt.Errorf("failed to initialize gopls: %w", err)
+		}
+	}
+
+	// Read file content for DidOpen
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read file content: %w", err)
+	}
+
+	// Convert file path to URI and open the document in gopls
+	uri := "file://" + filePath
+	err = gt.goplsClient.DidOpen(uri, "go", string(content))
+	if err != nil {
+		return fmt.Errorf("failed to open document in gopls: %w", err)
+	}
+
+	return nil
+}
+
+// findSymbolPosition finds the position of a symbol in the file content
+func (gt *GoplsTool) findSymbolPosition(content, symbol string) *protocol.Position {
+	lines := strings.Split(content, "\n")
+
+	for lineNum, line := range lines {
+		// Look for the symbol in various contexts
+		patterns := []string{
+			fmt.Sprintf("func %s(", symbol),
+			fmt.Sprintf("func (%s)", symbol),
+			fmt.Sprintf("type %s ", symbol),
+			fmt.Sprintf("var %s ", symbol),
+			fmt.Sprintf("const %s ", symbol),
+			fmt.Sprintf("%s :=", symbol),
+			fmt.Sprintf("%s =", symbol),
+		}
+
+		for _, pattern := range patterns {
+			if idx := strings.Index(line, pattern); idx != -1 {
+				return &protocol.Position{
+					Line:      lineNum,
+					Character: idx,
+				}
+			}
+		}
+
+		// Also try simple word boundary match
+		if strings.Contains(line, symbol) {
+			idx := strings.Index(line, symbol)
+			return &protocol.Position{
+				Line:      lineNum,
+				Character: idx,
+			}
+		}
+	}
+
+	return nil
+}
+
+// getDefinitionAtPosition gets the definition at a specific position using gopls
+func (gt *GoplsTool) getDefinitionAtPosition(filePath string, position protocol.Position) (*protocol.Location, error) {
+	// Convert file path to URI
+	uri := "file://" + filePath
+
+	locations, err := gt.goplsClient.GoToDefinition(uri, position.Line, position.Character)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(locations) == 0 {
+		return nil, fmt.Errorf("no definition found")
+	}
+
+	return &locations[0], nil
+}
+
+// getCodeAtLocation retrieves the actual code content at a given location
+func (gt *GoplsTool) getCodeAtLocation(location *protocol.Location) (string, error) {
+	// Extract file path from URI
+	filePath := strings.TrimPrefix(location.URI, "file://")
+
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(string(content), "\n")
+	startLine := location.Range.Start.Line
+	endLine := location.Range.End.Line
+
+	if startLine >= len(lines) {
+		return "", fmt.Errorf("start line out of bounds")
+	}
+
+	if endLine >= len(lines) {
+		endLine = len(lines) - 1
+	}
+
+	// Extract the relevant lines
+	var result strings.Builder
+	for i := startLine; i <= endLine; i++ {
+		if i < len(lines) {
+			result.WriteString(lines[i])
+			if i < endLine {
+				result.WriteString("\n")
+			}
+		}
+	}
+
+	return result.String(), nil
+}
+
+// Close closes the gopls client
+func (gt *GoplsTool) Close() error {
+	if gt.goplsClient != nil {
+		return gt.goplsClient.Close()
+	}
+	return nil
+}
+
+// storeResponseToFile stores the Gemini response to a file
+func (gc *GeminiClient) storeResponseToFile(resp *genai.GenerateContentResponse, filePath string) error {
+	// Add timestamp to filename
+	timestamp := time.Now().Format("2006-01-02_15-04-05")
+	timestampedPath := fmt.Sprintf("%s_%s", timestamp, filePath)
+
+	// Create a structured representation of the response
+	var responseData struct {
+		Timestamp  string               `json:"timestamp"`
+		Candidates []*genai.Candidate   `json:"candidates"`
+		Usage      *genai.UsageMetadata `json:"usage_metadata,omitempty"`
+	}
+
+	responseData.Timestamp = timestamp
+	responseData.Candidates = resp.Candidates
+	responseData.Usage = resp.UsageMetadata
+
+	// Marshal to JSON for readability
+	data, err := json.MarshalIndent(responseData, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal response: %w", err)
+	}
+
+	// Write to file
+	err = os.WriteFile(timestampedPath, data, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write response to file: %w", err)
+	}
+
+	gc.logger.Info("Response successfully stored to file", zap.String("filePath", timestampedPath))
+	return nil
+}
+
+// storeDebugInfo stores debug information to a file
+func (gc *GeminiClient) storeDebugInfo(resp *genai.GenerateContentResponse, filePath string) error {
+	// Add timestamp to filename
+	timestamp := time.Now().Format("2006-01-02_15-04-05")
+	timestampedPath := fmt.Sprintf("%s_%s", timestamp, filePath)
+
+	// Convert the entire response to JSON for debugging
+	data, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal debug info: %w", err)
+	}
+
+	// Write JSON data to file
+	err = os.WriteFile(timestampedPath, data, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write debug info to file: %w", err)
+	}
+
+	gc.logger.Info("Debug info successfully stored to file", zap.String("filePath", timestampedPath))
+	return nil
 }
 
 func main() {
@@ -332,17 +736,17 @@ func main() {
 	}
 	defer geminiClient.Close()
 
-	// Example usage
-	prompt := "Can you analyze the directory structure of the current working directory? Use the get_directory_structure tool to examine the project structure and tell me what type of project this appears to be."
+	// Test the code definitions functionality
+	prompt := "Please use the analyze_go_code tool to get code definitions for the symbols 'GeminiClient', 'NewGeminiClient', and 'GenerateContent' from the file '/Users/ayush/keploy/havetodelete/gemini-tool-calls/main.go'."
 
-	logger.Info("Sending prompt to Gemini 2.5 Pro", zap.String("prompt", prompt))
+	logger.Info("Sending prompt to Gemini 2.5 Pro", zap.Int("promptLength", len(prompt)))
 	response, err := geminiClient.GenerateContent(ctx, prompt)
 	if err != nil {
 		logger.Fatal("Failed to generate content", zap.Error(err))
 	}
 
 	logger.Info("Gemini Response",
-		zap.String("prompt", prompt),
+		zap.Int("promptLength", len(prompt)),
 		zap.String("response", response))
 	logger.Info("Application completed successfully")
 }
