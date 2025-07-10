@@ -1,0 +1,2099 @@
+Here is the source file that you will be refactoring if needed and writing tests against, called `/var/folders/p2/8fbl_ngs52l2mzvzcyr5q9b40000gn/T/repo-replica-enterprise-2251116249/pkg/service/utgenv2/gen.go`. Line numbers have been added for clarity and are not part of the original code.
+    =========
+    1 package utgenv2
+    2
+    3 import (
+    4 	"bytes"
+    5 	"context"
+    6 	"errors"
+    7 	"fmt"
+    8 	"go/parser"
+    9 	"go/token"
+    10 	"io"
+    11 	"math"
+    12 	"os"
+    13 	"os/exec"
+    14 	"path/filepath"
+    15 	"runtime"
+    16 	"strings"
+    17 	"time"
+    18
+    19 	"github.com/keploy/enterprise/pkg/models"
+    20
+    21 	"github.com/google/uuid"
+    22 	"github.com/k0kubun/pp/v3"
+    23 	ossModels "go.keploy.io/server/v2/pkg/models"
+    24
+    25 	"gopkg.in/yaml.v2"
+    26
+    27 	"github.com/keploy/enterprise/config"
+    28 	"github.com/keploy/enterprise/pkg/models/ai"
+    29 	utgenModels "github.com/keploy/enterprise/pkg/models/ai"
+    30 	coverageSvc "github.com/keploy/enterprise/pkg/service/coverage"
+    31 	languageSvc "github.com/keploy/enterprise/pkg/service/language"
+    32 	"github.com/keploy/enterprise/pkg/service/language/golang"
+    33 	"github.com/keploy/enterprise/pkg/service/language/java"
+    34 	"github.com/keploy/enterprise/pkg/service/language/javascript"
+    35 	"github.com/keploy/enterprise/pkg/service/language/python"
+    36 	"github.com/keploy/enterprise/pkg/service/language/react"
+    37 	"github.com/keploy/enterprise/pkg/util"
+    38 	"go.keploy.io/server/v2/pkg/service"
+    39 	"go.keploy.io/server/v2/utils"
+    40 	"go.uber.org/zap"
+    41 )
+    42
+    43 // Assignable wrappers for system and utility functions for testability
+    44 var osTempDir123 = os.TempDir
+    45 var osMkdirAll123 = os.MkdirAll
+    46 var osStat123 = os.Stat
+    47 var osOpen123 = os.Open
+    48 var osOpenFile123 = os.OpenFile
+    49 var osRemove123 = os.Remove
+    50 var osWriteFile123 = os.WriteFile
+    51 var osReadFile123 = os.ReadFile
+    52 var osGetwd123 = os.Getwd
+    53 var filepathJoin123 = filepath.Join
+    54 var filepathExt123 = filepath.Ext
+    55 var filepathBase123 = filepath.Base
+    56 var filepathDir123 = filepath.Dir
+    57 var fmtSprintf123 = fmt.Sprintf
+    58 var fmtErrorf123 = fmt.Errorf
+    59 var timeNow123 = time.Now
+    60 var timeSince123 = time.Since
+    61 var timeSecond123 = time.Second
+    62 var contextWithTimeout123 = context.WithTimeout
+    63 var execCommandContext123 = exec.CommandContext
+    64 var stringsHasPrefix123 = strings.HasPrefix
+    65 var stringsTrimPrefix123 = strings.TrimPrefix
+    66 var stringsSplitN123 = strings.SplitN
+    67 var stringsTrimSpace123 = strings.TrimSpace
+    68 var stringsRepeat123 = strings.Repeat
+    69
+    70 type UnitTestGenerator struct {
+    71 	cfg    *config.Config
+    72 	logger *zap.Logger
+    73
+    74 	// service
+    75 	tel         Telemetry
+    76 	analytics   *AnalyticsClient
+    77 	api         models.API
+    78 	langSvc     languageSvc.Service
+    79 	coverageSvc coverageSvc.Service
+    80 }
+    81
+    82 func New(cfg *config.Config, logger *zap.Logger, tel Telemetry, auth service.Auth, api models.API, coverageSvc coverageSvc.Service) Service {
+    83 	return &UnitTestGenerator{
+    84 		cfg:         cfg,
+    85 		logger:      logger,
+    86 		tel:         tel,
+    87 		analytics:   NewAnalyticsClient(logger, cfg.EntConfig.APIBaseURL, auth), //nolint
+    88 		api:         api,
+    89 		coverageSvc: coverageSvc,
+    90 	}
+    91 }
+    92
+    93 // Execute implements Service.
+    94 func (u *UnitTestGenerator) Execute(ctx context.Context, req *ExecuteRequest) (*ExecuteResponse, error) {
+    95 	out, err := util.RunCommand(ctx, u.logger, req.Command, req.Dir)
+    96 	if err != nil {
+    97 		return nil, err
+    98 	}
+    99 	return &ExecuteResponse{
+    100 		ExitCode: out.ExitCode,
+    101 		Output:   out.Stdout,
+    102 	}, nil
+    103 }
+    104
+    105 type FailedTestYAML struct {
+    106 	SessionID     string `yaml:"session_id"`
+    107 	FilePath      string `yaml:"file_path"`
+    108 	TestCode      string `yaml:"test_code"`
+    109 	CompleteError string `yaml:"complete_error"`
+    110 	Iteration     int    `yaml:"iteration"`
+    111 	ImportDetails string `yaml:"import_details"`
+    112 }
+    113
+    114 type FailedTestsYAML struct {
+    115 	FailedTests []FailedTestYAML `yaml:"failed_tests"`
+    116 }
+    117
+    118 func (u *UnitTestGenerator) storeFailedTests(sessionID string, failedTests []*ai.FailedUT, iterationCount int, srcFilePath string) error {
+    119 	tempDir := osTempDir123()
+    120 	keployUTGFolderPath := filepathJoin123(tempDir, "keploy-utg")
+    121
+    122 	err := osMkdirAll123(keployUTGFolderPath, os.ModePerm)
+    123 	if err != nil {
+    124 		return fmtErrorf123("error creating keploy-utg folder: %w", err)
+    125 	}
+    126
+    127 	filePath := filepathJoin123(keployUTGFolderPath, fmtSprintf123("failed_tests_session_%s.yaml", sessionID))
+    128
+    129 	var existingData FailedTestsYAML
+    130
+    131 	// If the file exists, read and decode it
+    132 	if _, err := osStat123(filePath); err == nil {
+    133 		file, err := osOpen123(filePath)
+    134 		if err != nil {
+    135 			return fmtErrorf123("error opening existing YAML file: %w", err)
+    136 		}
+    137 		defer func(file *os.File) {
+    138 			err := file.Close()
+    139 			if err != nil {
+    140 				u.logger.Error("Error closing file", zap.Error(err))
+    141 			}
+    142 		}(file)
+    143
+    144 		decoder := yaml.NewDecoder(file)
+    145 		if err := decoder.Decode(&existingData); err != nil && !errors.Is(err, io.EOF) {
+    146 			return fmtErrorf123("error decoding existing YAML: %w", err)
+    147 		}
+    148 	}
+    149
+    150 	// Append new failed tests
+    151 	for _, failedTest := range failedTests {
+    152 		existingData.FailedTests = append(existingData.FailedTests, FailedTestYAML{
+    153 			ImportDetails: failedTest.NewImportsCode,
+    154 			SessionID:     sessionID,
+    155 			FilePath:      srcFilePath,
+    156 			TestCode:      failedTest.TestCode,
+    157 			CompleteError: failedTest.CompleteError,
+    158 			Iteration:     iterationCount,
+    159 		})
+    160 	}
+    161
+    162 	// Write merged data back to file
+    163 	file, err := osOpenFile123(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+    164 	if err != nil {
+    165 		return fmtErrorf123("error opening file for writing: %w", err)
+    166 	}
+    167 	defer func(file *os.File) {
+    168 		err := file.Close()
+    169 		if err != nil {
+    170 			u.logger.Error("Error closing file", zap.Error(err))
+    171 		}
+    172 	}(file)
+    173
+    174 	encoder := yaml.NewEncoder(file)
+    175 	defer func(encoder *yaml.Encoder) {
+    176 		err := encoder.Close()
+    177 		if err != nil {
+    178 			u.logger.Error("Error closing encoder", zap.Error(err))
+    179 		}
+    180 	}(encoder)
+    181 	if err := encoder.Encode(existingData); err != nil {
+    182 		return fmtErrorf123("error writing to YAML file: %w", err)
+    183 	}
+    184
+    185 	u.logger.Info("Successfully appended failed tests to file", zap.String("file", filePath))
+    186 	return nil
+    187 }
+    188
+    189 func (u *UnitTestGenerator) setup(ctx context.Context, cfg *ai.GenerateTestCfg) ([]string, error) {
+    190 	if cfg.Lang == "" {
+    191 		cfg.Lang = GetCodeLanguage(u.logger, cfg.SrcFilePath)
+    192 	}
+    193
+    194 	extension := filepath.Ext(cfg.SrcFilePath)
+    195
+    196 	// TODO: removing this if condition have to find a workaround to set the language service at a common place at the beginning of the test generation
+    197 	// if !cfg.IsPR {
+    198 	//TODO: use language models and not these strings
+    199 	switch extension {
+    200 	case ".go":
+    201 		u.langSvc = golang.New(ctx, u.logger, u.coverageSvc)
+    202 	case ".py":
+    203 		u.langSvc = python.New(ctx, u.logger, cfg, u.coverageSvc)
+    204 	case ".js", ".ts":
+    205 		u.langSvc = javascript.New(ctx, u.logger, u.coverageSvc)
+    206 	case ".jsx", ".tsx":
+    207 		u.langSvc = react.New(ctx, u.logger, u.coverageSvc)
+    208 	case ".java":
+    209 		u.langSvc = java.New(ctx, u.logger, u.coverageSvc)
+    210 	default:
+    211 		return nil, fmt.Errorf("unsupported file extension %s for test generation", extension)
+    212 	}
+    213 	// }
+    214
+    215 	// need java check here
+    216 	testDependencies, err := u.langSvc.GetTestDependencies(ctx, u.logger, cfg.RootDir)
+    217 	if err != nil {
+    218 		u.logger.Error("Error getting test dependencies", zap.Error(err))
+    219 		return nil, fmt.Errorf("failed to get test dependencies for extension %s: %w", extension, err)
+    220 	}
+    221 	return testDependencies, nil
+    222
+    223 }
+    224
+    225 // GenerateTests implements Service.
+    226 func (u *UnitTestGenerator) GenerateTests(ctx context.Context, cfg *ai.GenerateTestCfg) error {
+    227 	sessionID := uuid.NewString()
+    228 	u.logger.Info(fmt.Sprintf("Session ID: %s", sessionID))
+    229
+    230 	defer func() {
+    231 		u.logger.Debug("Closing Event Channel")
+    232 		close(cfg.EventChannel)
+    233 	}()
+    234
+    235 	var originalTestFileContent, srcCode string
+    236
+    237 	srcCode, err := readFile(cfg.SrcFilePath)
+    238 	if err != nil {
+    239 		u.logger.Error("error reading source code", zap.Error(err))
+    240 		return err
+    241 	}
+    242
+    243 	newTestFile := false
+    244
+    245 	newTestFile, err = IsNewTestFile(u.logger, cfg.TestFilePath, cfg.SrcFilePath, cfg.RootDir)
+    246 	if err != nil {
+    247 		u.logger.Error("error checking if test file is newly created", zap.Error(err))
+    248 		return err
+    249 	}
+    250
+    251 	if !newTestFile {
+    252 		originalTestFileContent, err = readFile(cfg.TestFilePath)
+    253 		if err != nil {
+    254 			u.logger.Error("error reading original test file content", zap.Error(err))
+    255 			return err
+    256 		}
+    257 	}
+    258
+    259 	var overallCoverageIncreased bool
+    260 	// these are for tests
+    261 	totalTestCase, totalPassed, totalFailed, totalNoCoverage, totalOverallCovInc := 0, 0, 0, 0, 0
+    262 	var totalLinesCovered int64
+    263
+    264 	defer func() {
+    265 		u.logger.Info("Finalizing test generation process")
+    266
+    267 		if totalPassed == 0 && !overallCoverageIncreased {
+    268
+    269 			err := revertSourceCode(cfg.SrcFilePath, srcCode, true)
+    270 			if err != nil {
+    271 				u.logger.Error("Error reverting source code", zap.Error(err))
+    272 			}
+    273
+    274 			if newTestFile {
+    275 				u.logger.Info("No tests generated, removing the generated test file")
+    276 				if err := os.Remove(cfg.TestFilePath); err != nil {
+    277 					u.logger.Error("Error removing test file", zap.Error(err))
+    278 				}
+    279 			} else {
+    280 				u.logger.Info("No tests generated, reverting changes to original test file content")
+    281 				if err := os.WriteFile(cfg.TestFilePath, []byte(originalTestFileContent), 0644); err != nil {
+    282 					u.logger.Error("Error reverting test file content", zap.Error(err))
+    283 				}
+    284 			}
+    285 		}
+    286 	}()
+    287
+    288 	u.tel.GenerateUT()
+    289 	// Check for context cancellation before proceeding
+    290 	select {
+    291 	case <-ctx.Done():
+    292 		return fmt.Errorf("generate tests request cancelled: %w", ctx.Err())
+    293 	default:
+    294 		// Continue if no cancellation
+    295 	}
+    296
+    297 	testDependencies, err := u.setup(ctx, cfg)
+    298 	if err != nil {
+    299 		return err
+    300 	}
+    301
+    302 	promptBuilderCfg := &ai.PromptBuilderCfg{
+    303 		SrcFilePath:       cfg.SrcFilePath,
+    304 		TestFilePath:      cfg.TestFilePath,
+    305 		CovReportContent:  "", // an empty check just for java version
+    306 		Language:          cfg.Lang,
+    307 		AdditionalPrompt:  cfg.AdditionalPrompt,
+    308 		FunctionUnderTest: cfg.FunctionUnderTest,
+    309 		PRWorkflow:        cfg.PRWorkflow,
+    310 	}
+    311 	iterationCount := 1
+    312 	promptBuilder, err := NewPromptBuilder(u.logger, promptBuilderCfg)
+    313 	if err != nil {
+    314 		u.logger.Error("error creating prompt builder", zap.Error(err))
+    315 		return err
+    316 	}
+    317 	if cfg.Lang == utgenModels.JAVA {
+    318 		err = u.installSpecificJavaVersion(ctx, u.logger, promptBuilder, sessionID, cfg.RootDir)
+    319 		if err != nil {
+    320 			u.logger.Error("error installing specific version of java", zap.Error(err))
+    321 			return err
+    322 		}
+    323 	}
+    324
+    325 	for _, cmd := range testDependencies {
+    326 		u.logger.Info(fmt.Sprintf("Running command: %s", cmd))
+    327 		_, err := util.RunCommand(ctx, u.logger, cmd, cfg.RootDir)
+    328 		if err != nil {
+    329 			u.logger.Error("Error running command", zap.String("command", cmd), zap.Error(err))
+    330 			return fmt.Errorf("failed to install dependencies for extension %s: %w", cfg.Lang, err)
+    331 		}
+    332 	}
+    333
+    334 	moduleName, _ := u.langSvc.GetModuleName(cfg.SrcFilePath, cfg.RootDir)
+    335
+    336 	coverage, coverageResult, err := languageSvc.ManageCoverage(ctx, u.logger, cfg, newTestFile, moduleName)
+    337 	if err != nil {
+    338 		u.logger.Error("error calculating coverage", zap.Error(err))
+    339 		return err
+    340 	}
+    341 	promptBuilder.CovReportContent = coverage.Content
+    342
+    343 	const paddingHeight = 1
+    344 	columnWidths3 := []int{29, 29, 29}
+    345 	columnWidths2 := []int{40, 40}
+    346 	var disableAnsi = u.cfg.DisableANSI
+    347
+    348 	u.logger.Info(fmt.Sprintf("Generating tests for file: %s", cfg.SrcFilePath))
+    349
+    350 	// these are for tests
+    351 	totalTestCase, totalPassed, totalFailed, totalNoCoverage, totalOverallCovInc = 0, 0, 0, 0, 0
+    352
+    353 	languageEvent := ai.LanguageEvent{
+    354 		Language: cfg.Lang,
+    355 	}
+    356
+    357 	var event ai.Event
+    358 	// sending language event
+    359 	event = ai.NewEvent(ai.Lang, languageEvent)
+    360 	u.logger.Info("Language Event", zap.Any("event", event))
+    361 	u.FlushData(ctx, cfg, event)
+    362
+    363 	testTypeEvent := ai.TestTypeEvent{
+    364 		FileName: getFilename(cfg.SrcFilePath),
+    365 	}
+    366
+    367 	if len(cfg.FunctionUnderTest) > 0 {
+    368 		testTypeEvent.FunctionUnderTest = cfg.FunctionUnderTest
+    369 	}
+    370
+    371 	// sending test type event
+    372 	event = ai.NewEvent(ai.TestType, testTypeEvent)
+    373 	u.logger.Info("Test Type Event", zap.Any("event", event))
+    374 	u.FlushData(ctx, cfg, event)
+    375
+    376 	iniCovEvent := ai.ProgressStatusEvent{
+    377 		Message: fmt.Sprintf("Calculating initial coverage for %s", getFilename(cfg.SrcFilePath)),
+    378 	}
+    379
+    380 	// sending initial coverage event
+    381 	event = ai.NewEvent(ai.InitialCoverage, iniCovEvent)
+    382 	u.logger.Info("Initial Coverage Event", zap.Any("event", event))
+    383 	u.FlushData(ctx, cfg, event)
+    384
+    385 	prevProjectCoverage := coverageResult
+    386
+    387 	startingCoverage := coverage.Current
+    388 	coverageDeltaMap := make(map[string]float64)
+    389 	// if the test file is new then send initial coverage as 0
+    390 	if newTestFile && cfg.Lang != ai.GOLANG {
+    391 		startingCoverage = 0
+    392 	}
+    393
+    394 	calculatedCov := ai.CalculatedCoverageEvent{
+    395 		File:                  cfg.SrcFilePath,
+    396 		FileCoverage:          math.Round(startingCoverage * 100),
+    397 		ProjectCoverage:       math.Round(coverageSvc.GetCoveragePercentage(prevProjectCoverage, cfg.Lang) * 100),
+    398 		LinesCoveredInitially: len(coverageResult[cfg.SrcFilePath].LinesCovered),
+    399 		TotalLines:            len(coverageResult[cfg.SrcFilePath].LinesCovered) + len(coverageResult[cfg.SrcFilePath].LinesMissed),
+    400 		SessionID:             sessionID,
+    401 	}
+    402
+    403 	// sending calculated coverage event
+    404 	event = ai.NewEvent(ai.CalculatedCoverage, calculatedCov)
+    405 	u.logger.Info("Calculated Coverage Event", zap.Any("event", event))
+    406 	u.FlushData(ctx, cfg, event)
+    407
+    408 	cursor := &Cursor{}
+    409
+    410 	isEmpty, err := utils.IsFileEmpty(cfg.TestFilePath)
+    411
+    412 	if err != nil {
+    413 		u.logger.Error("error checking if test file is empty", zap.Error(err))
+    414 		return err
+    415 	}
+    416 	var originalFuncCount int
+    417 	if !isEmpty {
+    418 		cursor, err = u.getCursor(ctx, promptBuilder, sessionID, cfg.Lang, newTestFile)
+    419 		if err != nil {
+    420 			u.logger.Error("error getting cursor", zap.Error(err))
+    421 			return err
+    422 		}
+    423 		originalContent, _ := os.ReadFile(cfg.TestFilePath)
+    424 		var originalFuncs []string
+    425 		if cfg.Lang == ai.GOLANG {
+    426 			originalFuncs, _ = golang.ExtractTestFunctions(string(originalContent))
+    427 		}
+    428 		originalFuncCount = len(originalFuncs)
+    429 		u.logger.Debug("Original function count:", zap.Int("count", originalFuncCount))
+    430 	}
+    431
+    432 	initialCoverage := coverage.Current
+    433 	nextIndex, err := getNextFileIndex()
+    434 	if err != nil {
+    435 		u.logger.Error("error getting next file index", zap.Error(err))
+    436 		return err
+    437 	}
+    438
+    439 	var failedTests []*ai.FailedUT
+    440
+    441 	injector := NewInjectorBuilder(u.logger, cfg.Lang, u.langSvc, cfg.PythonTestConf)
+    442 	if cfg.Lang == ai.GOLANG {
+    443 		promptBuilder.IsFileDependent, err = golang.DetectInterfaceDependency(cfg.SrcFilePath)
+    444 		if err != nil {
+    445 			u.logger.Error("Error detecting interface dependency", zap.Error(err))
+    446 			return err
+    447 		}
+    448 	}
+    449 	u.logger.Info("Detecting interface dependency", zap.Bool("isFileDependent", promptBuilder.IsFileDependent))
+    450 	var fileReferences []string
+    451 	needStructRefactoring := false
+    452 	if !promptBuilder.IsFileDependent {
+    453 		// We only pass Golang untill we implement for other lang
+    454 		if cfg.Lang == utgenModels.GOLANG {
+    455 			fileReferences, err = u.langSvc.RefactorStructReferencesToInterface(ctx, u.logger, cfg)
+    456 			if err == nil {
+    457 				u.logger.Info("File References : ", zap.Any("Files", fileReferences))
+    458 				needStructRefactoring = true
+    459 			}
+    460 		}
+    461 	}
+    462
+    463 	err = u.processRefactoringAndMocks(ctx, u.logger, cfg, promptBuilder, injector, sessionID)
+    464 	if err != nil {
+    465 		u.logger.Error("error in refactoring and mocking file", zap.Error(err))
+    466 		return err
+    467 	}
+    468 	err = u.processCommentSanitization(ctx, u.logger, cfg, promptBuilder, sessionID)
+    469 	if err != nil {
+    470 		u.logger.Error("error in refactoring and mocking file", zap.Error(err))
+    471 		return err
+    472 	}
+    473
+    474 	// updating the source code in the prompt builder in case of refactored source file
+    475 	data, err := os.ReadFile(cfg.SrcFilePath)
+    476 	if err != nil {
+    477 		u.logger.Error("failed to update the prompt source code", zap.Error(err))
+    478 		return err
+    479 	}
+    480 	promptBuilder.Src.Code = string(data)
+    481 	if needStructRefactoring {
+    482 		promptBuilder.Src.Code, err = util.AppendFilesToCode(promptBuilder.Src.Code, fileReferences)
+    483 		if err != nil {
+    484 			u.logger.Error("error concatenating the src code with the referenced files", zap.Error(err))
+    485 			return err
+    486 		}
+    487 	}
+    488 	sourceFilePaths := []string{cfg.SrcFilePath}
+    489
+    490 	if cfg.Lang == ai.GOLANG && filepath.Base(cfg.SrcFilePath) == "schema.resolvers.go" {
+    491 		resolverFilePath := filepath.Join(filepath.Dir(cfg.SrcFilePath), "resolver.go")
+    492 		sourceFilePaths = append(sourceFilePaths, resolverFilePath)
+    493 	}
+    494
+    495 	modelDetails := u.langSvc.GetModelDetails(sourceFilePaths, cfg.RootDir)
+    496
+    497 	if cfg.Lang == ai.GOLANG {
+    498
+    499 		internalImports, splImport, err := u.langSvc.GetInternalImports(cfg.RootDir, cfg.SrcFilePath, moduleName)
+    500 		if err != nil {
+    501 			u.logger.Error("Error getting internal imports", zap.Error(err))
+    502 		}
+    503
+    504 		if len(splImport) > 0 {
+    505 			promptBuilder.IsMongoDB = true
+    506 		}
+    507
+    508 		if filepath.Base(cfg.SrcFilePath) == "schema.resolvers.go" {
+    509 			resolverFilePath := filepath.Join(filepath.Dir(cfg.SrcFilePath), "resolver.go")
+    510 			resolverFileImports, _, err := u.langSvc.GetInternalImports(cfg.RootDir, resolverFilePath, moduleName)
+    511
+    512 			if err == nil {
+    513 				internalImports = append(internalImports, resolverFileImports...)
+    514 			}
+    515 		}
+    516
+    517 		// Build the prompt with imports for mocks in the same package
+    518 		stringBuilder := strings.Builder{}
+    519 		for _, imp := range internalImports {
+    520 			// Now we directly use the package import path, no need to adjust for mocks as they are in the same package
+    521 			mockPath := filepath.Join(cfg.RootDir, imp)
+    522 			if info, err := os.Stat(mockPath); err != nil || !info.IsDir() {
+    523 				continue
+    524 			}
+    525
+    526 			// Directly use the import path for the mocks
+    527 			importPath := fmt.Sprintf("%s/%s", moduleName, imp)
+    528 			stringBuilder.WriteString("\n")
+    529 			stringBuilder.WriteString("-")
+    530 			stringBuilder.WriteString(importPath)
+    531 		}
+    532
+    533 		if stringBuilder.Len() > 0 {
+    534 			promptBuilder.MocksPath = stringBuilder.String()
+    535 		}
+    536 	}
+    537
+    538 	// [UTG_PROGRESS] This log is used to calculate progress for streaming updates in workflow
+    539 	//  Marks the test generation is ready
+    540 	u.logger.Info("[UTG_PROGRESS] test-generation-ready")
+    541 	for coverage.Current < (coverage.Desired/100) && iterationCount <= cfg.MaxIterations {
+    542 		iterationEvent := ai.IterationEvent{
+    543 			Iteration: int32(iterationCount),
+    544 		}
+    545
+    546 		// sending iteration event
+    547 		event = ai.NewEvent(ai.Iteration, iterationEvent)
+    548 		u.logger.Info("Iteration Event", zap.Any("event", event))
+    549 		// [UTG_PROGRESS] This log is used to calculate progress for streaming updates in workflow
+    550 		//  Marks the iteration <n> of test generation
+    551 		total := cfg.TotalIterations
+    552 		if total == 0 {
+    553 			total = cfg.MaxIterations
+    554 		}
+    555 		u.logger.Info(fmt.Sprintf("[UTG_PROGRESS] iteration-%d/%d", iterationCount, total))
+    556
+    557 		u.FlushData(ctx, cfg, event)
+    558
+    559 		u.logger.Info(fmt.Sprintf("Event Iteration %d", iterationCount))
+    560
+    561 		pass, fail, noCoverage, total, overAllCovInc := 0, 0, 0, 0, 0
+    562 		select {
+    563 		case <-ctx.Done():
+    564 			return fmt.Errorf("process cancelled by user")
+    565 		default:
+    566 		}
+    567
+    568 		pp.SetColorScheme(ossModels.GetPassingColorScheme())
+    569
+    570 		if _, err := pp.Printf("Current Coverage: %f%% for file %s\n", math.Round(coverage.Current*100), cfg.SrcFilePath); err != nil {
+    571 			u.logger.Error("error printing current coverage", zap.Error(err))
+    572 		}
+    573 		if _, err := pp.Printf("Desired Coverage: %f%% for file %s\n", coverage.Desired, cfg.SrcFilePath); err != nil {
+    574 			u.logger.Error("error printing desired coverage", zap.Error(err))
+    575 		}
+    576
+    577 		failedTestRunsValue := ""
+    578 		if len(failedTests) > 0 {
+    579 			for _, failedTest := range failedTests {
+    580 				code := failedTest.TestCode
+    581 				errorMessage := failedTest.ErrorMsg
+    582 				failedTestRunsValue += fmt.Sprintf("Failed Test:\n\n%s\n\n", code)
+    583 				if errorMessage != "" {
+    584 					failedTestRunsValue += fmt.Sprintf("Error message for test above:\n%s\n\n\n", errorMessage)
+    585 				} else {
+    586 					failedTestRunsValue += "\n\n"
+    587 				}
+    588 			}
+    589 			// Store failed test cases to a file
+    590 			err := u.storeFailedTests(sessionID, failedTests, iterationCount, cfg.SrcFilePath)
+    591 			if err != nil {
+    592 				u.logger.Error("Error saving failed test cases to file", zap.Error(err))
+    593 			}
+    594 		}
+    595
+    596 		// remove unused imports and run go mockery just before running tests
+    597 		if cfg.Lang == ai.GOLANG {
+    598 			err = golang.RemoveUnusedImports(ctx, u.logger, cfg.TestFilePath)
+    599 			if err != nil {
+    600 				u.logger.Error("Error removing unused imports", zap.Error(err))
+    601 				return err
+    602 			}
+    603
+    604 			moduleName, _ := u.langSvc.GetModuleName(cfg.SrcFilePath, cfg.RootDir)
+    605 			err = golang.RunMockery(ctx, u.logger, cfg, nil, moduleName)
+    606 			if err != nil {
+    607 				u.logger.Error("Error running mockery", zap.Error(err))
+    608 				return err
+    609 			}
+    610 		}
+    611
+    612 		librariesEvent := ai.PerIterationProgressEvent{
+    613 			Iteration: int32(iterationCount),
+    614 			Message:   fmt.Sprintf("Checking for libraries used at %s", cfg.RootDir),
+    615 		}
+    616
+    617 		// sending libraries event
+    618 		event = ai.NewEvent(ai.Libraries, librariesEvent)
+    619 		u.logger.Info("Libraries Event", zap.Any("event", event))
+    620 		u.FlushData(ctx, cfg, event)
+    621
+    622 		promptBuilder.InstalledPackages, err = u.langSvc.LibraryInstalled(ctx, u.logger, cfg.RootDir)
+    623
+    624 		promptBuilder.ImportDetails = modelDetails
+    625
+    626 		promptBuilder.ModuleName = moduleName
+    627 		if err != nil {
+    628 			u.logger.Error("error getting installed packages", zap.Error(err))
+    629 		}
+    630
+    631 		updatedTestContent, err := readFile(cfg.TestFilePath)
+    632 		if err != nil {
+    633 			u.logger.Error("Error reading updated test file content", zap.Error(err))
+    634 			return err
+    635 		}
+    636
+    637 		promptBuilder.Test.Code = updatedTestContent
+    638 		promptBuilder.CovReportContent = coverage.Content
+    639 		if cfg.PRWorkflow != nil {
+    640 			promptBuilder.LinesUnderTest = cfg.PRWorkflow.LinesUnderTest
+    641 		}
+    642 		promptFileName := u.langSvc.FetchPromptName("test_generation")
+    643 		prompt, err := promptBuilder.BuildPrompt(promptFileName, failedTestRunsValue)
+    644 		if err != nil {
+    645 			u.logger.Error("error building prompt", zap.Error(err))
+    646 			return err
+    647 		}
+    648
+    649 		failedTests = []*ai.FailedUT{}
+    650
+    651 		// Get the type of request purpose
+    652 		purpose := ai.UTG
+    653 		if len(cfg.FunctionUnderTest) > 0 {
+    654 			purpose = ai.UTGForFunction
+    655 		} else {
+    656 			//TODO: we should decide whether we have to send the function names or not to the vscode.
+    657 			// once decided then we can use functionsEvent struct otherwise we can use generic progress event struct
+    658
+    659 			// funcEvent := ai.FunctionsEvent{
+    660 			// 	Message: fmt.Sprintf("Detecting Functions of %s", cfg.SrcFilePath),
+    661 			// 	HasData: true,
+    662 			// }
+    663
+    664 			// functionsData, _ := ExtractFunctionsFromFile(u.logger, cfg.SrcFilePath, cfg.RootDir, false, true)
+    665
+    666 			// functionDataByte, err := json.Marshal(functionsData)
+    667 			// if err != nil {
+    668 			// 	u.logger.Error("error marshalling functions data", zap.Error(err))
+    669 			// 	return err
+    670 			// }
+    671 			// funcEvent.Data = string(functionDataByte)
+    672
+    673 			funcEvent := ai.PerIterationProgressEvent{
+    674 				Message:   fmt.Sprintf("Detecting Functions of %s", cfg.SrcFilePath),
+    675 				Iteration: int32(iterationCount),
+    676 			}
+    677
+    678 			// sending functions event
+    679 			event = ai.NewEvent(ai.Functions, funcEvent)
+    680 			u.logger.Info("Functions Event", zap.Any("event", event))
+    681 			u.FlushData(ctx, cfg, event)
+    682 		}
+    683
+    684 		testGenInfo := ai.TestGenerationInfoEvent{
+    685 			Message:   fmt.Sprintf("Generating Test cases for %s with %s ", cfg.SrcFilePath, getTestLibrary(cfg.Lang)),
+    686 			Library:   getTestLibrary(cfg.Lang),
+    687 			Iteration: int32(iterationCount),
+    688 		}
+    689
+    690 		if cfg.AdditionalPrompt != "" {
+    691 			testGenInfo.AdditionalPrompt = fmt.Sprintf(" Additional constraints: %s", cfg.AdditionalPrompt)
+    692 		}
+    693
+    694 		// sending test generation info event
+    695 		event = ai.NewEvent(ai.TestGenerationInfo, testGenInfo)
+    696 		u.logger.Info("Test Generation Info Event", zap.Any("event", event))
+    697 		u.FlushData(ctx, cfg, event)
+    698
+    699 		testsDetails, err := u.getTests(ctx, prompt, purpose, sessionID, iterationCount)
+    700 		if err != nil {
+    701 			if !errors.Is(err, context.Canceled) {
+    702 				u.logger.Error("error getting tests", zap.Error(err))
+    703 				//sending test generation failure event
+    704 				testGenFailureEvent := ai.TestGenerationFailureEvent{
+    705 					Iteration: int32(iterationCount),
+    706 					Error:     fmt.Sprintf("Failed to generate tests with error: %s", err.Error()),
+    707 					TestFile:  cfg.TestFilePath,
+    708 				}
+    709 				event = ai.NewEvent(ai.TestGenerationFailure, testGenFailureEvent)
+    710 				// sending test generation event
+    711 				u.logger.Info("Test Generation Failure Event", zap.Any("event", event))
+    712 				u.FlushData(ctx, cfg, event)
+    713
+    714 				iterationCount++
+    715 				continue
+    716 			}
+    717 			return err
+    718 		}
+    719 		if testsDetails == nil || len(testsDetails.NewTests) == 0 {
+    720 			u.logger.Info("No tests generated")
+    721 			testGenFailureEvent := ai.TestGenerationFailureEvent{
+    722 				Iteration: int32(iterationCount),
+    723 				Error:     fmt.Sprintf("No tests generated for file: %s", cfg.SrcFilePath),
+    724 				TestFile:  cfg.TestFilePath,
+    725 			}
+    726 			event = ai.NewEvent(ai.TestGenerationFailure, testGenFailureEvent)
+    727 			// sending test generation event
+    728 			u.logger.Info("Test Generation Failure Event", zap.Any("event", event))
+    729 			u.FlushData(ctx, cfg, event)
+    730
+    731 			iterationCount++
+    732 			continue
+    733 		}
+    734
+    735 		if cfg.Lang == ai.GOLANG && testsDetails.RefactoredSourceCode != nil {
+    736 			u.logger.Info("Refactored source code provided for testability, applying changes")
+    737
+    738 			originalSourceCodeContentBytes, err := os.ReadFile(cfg.SrcFilePath)
+    739 			if err != nil {
+    740 				u.logger.Error("Error reading original source code", zap.Error(err))
+    741 				return err
+    742 			}
+    743
+    744 			// Apply the refactored patch directly using the BlockPatch
+    745 			err = applyPatchToFile(ctx, u.logger, *testsDetails.RefactoredSourceCode, cfg.SrcFilePath, cfg.TestCommand, cfg.RootDir)
+    746 			if err != nil {
+    747 				u.logger.Warn("Failed to apply refactored source patch from test generation", zap.Error(err))
+    748 			} else {
+    749 				u.logger.Info("Applied refactored source code patch for better testability")
+    750 				err = golang.RunMockery(ctx, u.logger, cfg, nil, moduleName)
+    751 				if err != nil {
+    752 					u.logger.Warn("Error running mockery after refactor patch", zap.Error(err))
+    753 					u.logger.Warn("Reverting to original source code")
+    754 					err = revertFile(u.logger, cfg.SrcFilePath, originalSourceCodeContentBytes)
+    755 					if err != nil {
+    756 						u.logger.Warn("Error reverting to original source code", zap.Error(err))
+    757 					}
+    758 				}
+    759 			}
+    760 		}
+    761
+    762 		var testCovInc = false
+    763 		var overAllTestCovInc = false
+    764
+    765 		u.logger.Info("Validating new generated tests one by one")
+    766 		totalTestCase += len(testsDetails.NewTests)
+    767 		total = len(testsDetails.NewTests)
+    768
+    769 		// check context cancellation before proceeding
+    770 		select {
+    771 		case <-ctx.Done():
+    772 			return ctx.Err()
+    773 		default:
+    774 		}
+    775
+    776 		// Run the tests one by one
+    777 		for i, generatedTest := range testsDetails.NewTests {
+    778 			testGenEvent := ai.TestGenerationEvent{
+    779 				Iteration:      int32(iterationCount),
+    780 				Number:         int32(i + 1),
+    781 				Comment:        generatedTest.Comment,
+    782 				TestDetails:    generatedTest.TestCode,
+    783 				ImportDetails:  generatedTest.NewImportsCode,
+    784 				PackageDetails: generatedTest.LibraryInstallationCode,
+    785 				Language:       cfg.Lang,
+    786 			}
+    787
+    788 			// sending test generation event
+    789 			event = ai.NewEvent(ai.TestGeneration, testGenEvent)
+    790 			u.logger.Info("Test Generation Event", zap.Any("event", event))
+    791 			u.FlushData(ctx, cfg, event)
+    792
+    793 			// in case of java we should check if there are annotations being returned ,
+    794 			// we should check if those annotation already exists in the test file,
+    795 			// if it does then remove those annotation from generatedtest
+    796 			if cfg.Lang == ai.JAVA {
+    797 				generatedTest = java.CheckForExistingAnnotations(generatedTest, cfg.TestFilePath)
+    798 			}
+    799
+    800 			installedPackages, err := u.langSvc.LibraryInstalled(ctx, u.logger, cfg.RootDir)
+    801 			if err != nil {
+    802 				u.logger.Warn("Error getting installed packages", zap.Error(err))
+    803 			}
+    804 			// convert the installed packages to a map for easy lookup
+    805 			installedPackagesMap := make(map[string]struct{})
+    806 			for _, pkg := range installedPackages {
+    807 				installedPackagesMap[pkg] = struct{}{}
+    808 			}
+    809 			select {
+    810 			case <-ctx.Done():
+    811 				return fmt.Errorf("process cancelled by user")
+    812 			default:
+    813 			}
+    814
+    815 			validateTestInput := validateTestInput{
+    816 				generatedTest:       generatedTest,
+    817 				cur:                 cursor,
+    818 				installedPackages:   installedPackages,
+    819 				injector:            injector,
+    820 				srcDir:              cfg.SrcDir,
+    821 				testDir:             cfg.TestDir,
+    822 				rootDir:             cfg.RootDir,
+    823 				srcFilePath:         cfg.SrcFilePath,
+    824 				testFilePath:        cfg.TestFilePath,
+    825 				lang:                cfg.Lang,
+    826 				checkFlakiness:      cfg.Flakiness,
+    827 				testCommand:         cfg.TestCommand,
+    828 				cov:                 coverage,
+    829 				prevProjectCoverage: prevProjectCoverage,
+    830 				iterationCount:      int32(iterationCount),
+    831 				testNumber:          int32(i + 1),
+    832 				moduleName:          moduleName,
+    833 				promptBuilder:       promptBuilder,
+    834 				sessionID:           sessionID,
+    835 			}
+    836
+    837 			output, err := u.validateTest(ctx, cfg, validateTestInput, installedPackagesMap, u.langSvc, coverageDeltaMap)
+    838 			if err != nil {
+    839 				u.logger.Error("Error validating test", zap.Error(err))
+    840 				return err
+    841 			}
+    842 			if output.testResult == ai.Passed || output.testResult == ai.OverallCovInc {
+    843 				overallCoverageIncreased = true
+    844 			}
+    845 			switch output.testResult {
+    846 			case ai.Passed, ai.OverallCovInc:
+    847 				if output.testResult == ai.Passed {
+    848 					totalPassed++
+    849 					pass++
+    850 				}
+    851 				totalOverallCovInc++
+    852 				overAllCovInc++
+    853 				overAllTestCovInc = true
+    854 				prevProjectCoverage = output.currProjectCoverage
+    855 				totalLinesCovered += getAllLinesCovered(output.increasedProjectCoverage)
+    856 			case ai.Failed:
+    857 				totalFailed++
+    858 				fail++
+    859 				failedTests = append(failedTests, output.failedTest)
+    860 			case ai.NoCoverage:
+    861 				totalNoCoverage++
+    862 				noCoverage++
+    863 			}
+    864
+    865 			coverage.Current = output.cov.Current
+    866 			coverage.Content = output.cov.Content
+    867
+    868 			cursor.Line = output.cur.Line
+    869
+    870 			// if any test increases the coverage, set the flag to true
+    871 			testCovInc = testCovInc || (output.coverageIncreased || overAllTestCovInc)
+    872 		}
+    873
+    874 		if len(failedTests) > 0 {
+    875 			err := u.saveFailedTestCasesToFile(ctx, failedTests, nextIndex, iterationCount)
+    876 			if err != nil {
+    877 				u.logger.Error("Error saving failed test cases to file", zap.Error(err))
+    878 			}
+    879 		}
+    880
+    881 		runSummaryEvent := ai.TestSummaryEvent{
+    882 			Message:       fmt.Sprintf("Tests generated in Session %s in iteration %d", sessionID, iterationCount),
+    883 			TestAdded:     pass,
+    884 			BuildFailure:  fail,
+    885 			NoCovIncrease: noCoverage,
+    886 			TestRejected:  fail + noCoverage,
+    887 			TestFilePath:  cfg.TestFilePath,
+    888 		}
+    889
+    890 		if overAllTestCovInc {
+    891 			runSummaryEvent.CoverageIncreased = math.Round(coverage.Current * 100)
+    892 			runSummaryEvent.IsCoverageIncreased = true
+    893 		}
+    894
+    895 		// sending run summary event
+    896 		event = ai.NewEvent(ai.RunSummary, runSummaryEvent)
+    897 		u.logger.Info("Run Summary Event", zap.Any("event", event))
+    898 		u.FlushData(ctx, cfg, event)
+    899
+    900 		fmt.Printf("\n<=========================================>\n")
+    901 		fmt.Printf(("Tests generated in Session") + "\n")
+    902 		fmt.Printf("+-------------------------------+-------------------------------+-------------------------------+\n")
+    903 		fmt.Printf("| %s | %s | %s |\n",
+    904 			centerAlignText("Total Test Cases", 29),
+    905 			centerAlignText("Test Cases Passed", 29),
+    906 			centerAlignText("Test Cases Failed", 29))
+    907 		fmt.Printf("+-------------------------------+-------------------------------+-------------------------------+\n")
+    908 		fmt.Print(addHeightPadding(paddingHeight, 3, columnWidths3))
+    909 		fmt.Printf("| %s | %s | %s |\n",
+    910 			formatWithColor(centerAlignText(fmt.Sprintf("%d", total), 29), disableAnsi, 33),
+    911 			formatWithColor(centerAlignText(fmt.Sprintf("%d", pass), 29), disableAnsi, 32),
+    912 			formatWithColor(centerAlignText(fmt.Sprintf("%d", fail+noCoverage), 29), disableAnsi, 33))
+    913 		fmt.Print(addHeightPadding(paddingHeight, 3, columnWidths3))
+    914 		fmt.Printf("+-------------------------------+-------------------------------+-------------------------------+\n")
+    915 		fmt.Printf(("Discarded tests in session") + "\n")
+    916 		fmt.Printf("+------------------------------------------+------------------------------------------+\n")
+    917 		fmt.Printf("| %s | %s |\n",
+    918 			centerAlignText("Build failures", 40),
+    919 			centerAlignText("No Coverage output", 40))
+    920 		fmt.Printf("+------------------------------------------+------------------------------------------+\n")
+    921 		fmt.Print(addHeightPadding(paddingHeight, 2, columnWidths2))
+    922 		fmt.Printf("| %s | %s |\n",
+    923 			formatWithColor(centerAlignText(fmt.Sprintf("%d", fail), 40), disableAnsi, 35),
+    924 			formatWithColor(centerAlignText(fmt.Sprintf("%d", noCoverage), 40), disableAnsi, 92))
+    925 		fmt.Print(addHeightPadding(paddingHeight, 2, columnWidths2))
+    926 		fmt.Printf("+------------------------------------------+------------------------------------------+\n")
+    927 		fmt.Printf("<=========================================>\n")
+    928
+    929 		err = u.api.SendCoverageUpdate(ctx, purpose, sessionID, initialCoverage, coverage.Current, iterationCount)
+    930 		if err != nil {
+    931 			u.logger.Error("Error sending coverage update", zap.Error(err))
+    932 		}
+    933
+    934 		totalCoveragePercentage := coverageSvc.GetCoveragePercentage(prevProjectCoverage, cfg.Lang)
+    935 		totalLinesCovered, totalLinesInFile := 0, 0
+    936 		for _, v := range prevProjectCoverage {
+    937 			totalLinesCovered += int(len(v.LinesCovered))
+    938 			totalLinesInFile = int(len(v.LinesMissed)) + totalLinesCovered
+    939 		}
+    940
+    941 		if iterationCount == cfg.MaxIterations || coverage.Current >= (coverage.Desired/100) {
+    942
+    943 			dirName := filepath.Base(cfg.RootDir) // e.g. "repo-replica-enterprise-1205501817"
+    944
+    945 			var projectName string
+    946 			if strings.HasPrefix(dirName, "repo-replica-") {
+    947 				// strip the "repo-replica-" prefix
+    948 				tail := strings.TrimPrefix(dirName, "repo-replica-") // "enterprise-1205501817"
+    949 				// split off anything after the first dash
+    950 				parts := strings.SplitN(tail, "-", 2) // ["enterprise","1205501817"]
+    951 				projectName = parts[0]                // "enterprise"
+    952 			} else {
+    953 				projectName = dirName
+    954 			}
+    955
+    956 			// send the ut report to the api
+    957 			req := &ai.UTReportReq{
+    958
+    959 				AppID: filepath.Base(projectName),
+    960 				Coverage: ossModels.TestCoverage{
+    961 					TotalCov: fmt.Sprintf("%f", totalCoveragePercentage),
+    962 					Loc: ossModels.Loc{
+    963 						Covered: totalLinesCovered,
+    964 						Total:   totalLinesInFile,
+    965 					},
+    966 				},
+    967 				Keploy: ai.KeployUTReport{
+    968 					SessionID: sessionID,
+    969 					UTStats: ai.UTStats{
+    970 						LinesCovered:    int64(totalLinesCovered),
+    971 						PassedTests:     int64(totalOverallCovInc),
+    972 						FailedTests:     int64(totalFailed),
+    973 						NoCoverageTests: int64(totalNoCoverage),
+    974 					}},
+    975 			}
+    976
+    977 			u.logger.Info("uploading UT report", zap.Any("req", req))
+    978 			err = u.analytics.SendUTReport(ctx, req)
+    979 			if err != nil {
+    980 				u.logger.Error("Error uploading UT report", zap.Error(err))
+    981 			}
+    982 		}
+    983 		iterationCount++
+    984 	}
+    985
+    986 	err = u.langSvc.RemoveUnusedMocks(ctx, u.logger, cfg.SrcFilePath, cfg.RootDir)
+    987 	if err != nil {
+    988 		u.logger.Warn("Error removing unused mocks", zap.Error(err))
+    989 	}
+    990 	// if coverage.Current == 0 && newTestFile {
+    991 	// 	err := os.Remove(cfg.TestFilePath)
+    992 	// 	if err != nil {
+    993 	// 		u.logger.Error("Error removing test file", zap.Error(err))
+    994 	// 	}
+    995 	// }
+    996
+    997 	pp.SetColorScheme(ossModels.GetPassingColorScheme())
+    998 	if coverage.Current >= (coverage.Desired / 100) {
+    999 		if _, err := pp.Printf("For File %s Reached above target coverage of %s%% (Current Coverage: %s%%) in %s iterations.\n", cfg.SrcFilePath, coverage.Desired, math.Round(coverage.Current*100), iterationCount-1); err != nil {
+    1000 			u.logger.Error("failed to print coverage", zap.Error(err))
+    1001 		}
+    1002 	} else if iterationCount > cfg.MaxIterations {
+    1003 		if _, err := pp.Printf("For File %s Reached maximum iteration limit without achieving desired coverage. Current Coverage: %f%%\n", cfg.SrcFilePath, math.Round(coverage.Current*100)); err != nil {
+    1004 			u.logger.Error("failed to print coverage", zap.Error(err))
+    1005 		}
+    1006 	}
+    1007
+    1008 	coverage, finalCoverage, err := languageSvc.ManageCoverage(ctx, u.logger, cfg, newTestFile, moduleName)
+    1009
+    1010 	var linesCovered, totalLines int
+    1011
+    1012 	if err != nil {
+    1013 		u.logger.Error("Error calculating coverage", zap.Error(err))
+    1014 		return err
+    1015 	} else {
+    1016 		if finalCoverage[cfg.SrcFilePath] != nil {
+    1017 			linesCovered = len(finalCoverage[cfg.SrcFilePath].LinesCovered)
+    1018 			totalLines = len(finalCoverage[cfg.SrcFilePath].LinesCovered) + len(finalCoverage[cfg.SrcFilePath].LinesMissed)
+    1019 		} else {
+    1020 			linesCovered = 0
+    1021 			totalLines = 0
+    1022 		}
+    1023 	}
+    1024
+    1025 	summaryEvent := ai.TestSummaryEvent{
+    1026 		Message:       fmt.Sprintf("Tests generated in Session %s", sessionID),
+    1027 		TestAdded:     totalPassed,
+    1028 		BuildFailure:  totalFailed,
+    1029 		NoCovIncrease: totalNoCoverage,
+    1030 		TestRejected:  totalFailed + totalNoCoverage,
+    1031 		TestFilePath:  cfg.TestFilePath,
+    1032 		SessionId:     sessionID,
+    1033 		LinesCovered:  linesCovered,
+    1034 		TotalLines:    totalLines,
+    1035 	}
+    1036
+    1037 	if coverage.Current > initialCoverage {
+    1038 		summaryEvent.CoverageIncreased = math.Round(coverage.Current * 100)
+    1039 		summaryEvent.IsCoverageIncreased = true
+    1040 	}
+    1041
+    1042 	// sending summary event
+    1043 	event = ai.NewEvent(ai.Summary, summaryEvent)
+    1044 	u.logger.Info("Summary Event", zap.Any("event", event))
+    1045 	u.FlushData(ctx, cfg, event)
+    1046
+    1047 	// if cfg.Lang == utgenModels.GOLANG {
+    1048 	// 	err = golang.SortTestFunctionsByCoverageDelta(cfg.TestFilePath, coverageDeltaMap, originalFuncCount)
+    1049 	// 	if err != nil {
+    1050 	// 		u.logger.Error("Error sorting test functions by coverage delta", zap.Error(err))
+    1051 	// 	}
+    1052
+    1053 	// 	lastDeletedFuncStart := -1
+    1054
+    1055 	// 	for i := 0; i < len(coverageDeltaMap); i++ {
+    1056 	// 		tfContent, err := os.ReadFile(cfg.TestFilePath)
+    1057 	// 		if err != nil {
+    1058 	// 			u.logger.Error("Error reading test file", zap.Error(err))
+    1059 	// 			return fmt.Errorf("error reading test file: %w", err)
+    1060 	// 		}
+    1061
+    1062 	// 		err = golang.RemoveLastFunction(cfg.TestFilePath, &lastDeletedFuncStart)
+    1063 	// 		if err != nil {
+    1064 	// 			u.logger.Error("Error removing last function from test file", zap.Error(err))
+    1065 	// 			return fmt.Errorf("error removing last function from test file: %w", err)
+    1066 	// 		}
+    1067
+    1068 	// 		// need to remove unused imports as deleting test cases might not delete the imports
+    1069 	// 		err = golang.RemoveUnusedImports(ctx, u.logger, cfg.TestFilePath)
+    1070 	// 		if err != nil {
+    1071 	// 			u.logger.Error("Error removing unused imports from test file", zap.Error(err))
+    1072 	// 			return fmt.Errorf("error removing unused imports from test file: %w", err)
+    1073 	// 		}
+    1074
+    1075 	// 		_, coverageResult, err = languageSvc.ManageCoverage(ctx, u.logger, cfg, false)
+    1076 	// 		if err != nil {
+    1077 	// 			u.logger.Error("Error in coverage processing", zap.Error(err))
+    1078 	// 			return fmt.Errorf("error in coverage processing: %w", err)
+    1079 	// 		}
+    1080 	// 		if coverageSvc.GetCoveragePercentage(coverageResult, cfg.Lang) < coverageSvc.GetCoveragePercentage(prevProjectCoverage, cfg.Lang) {
+    1081 	// 			u.logger.Info("Coverage decreased after running the test, Reverting the test file")
+    1082
+    1083 	// 			// Clear the test file by writing an empty byte slice so that file becomes empty
+    1084 	// 			if err := os.WriteFile(cfg.TestFilePath, []byte{}, 0644); err != nil {
+    1085 	// 				return fmt.Errorf("failed to clear test file: %w", err)
+    1086 	// 			}
+    1087
+    1088 	// 			// Revert test file to original content
+    1089 	// 			if err := os.WriteFile(cfg.TestFilePath, []byte(tfContent), 0644); err != nil {
+    1090 	// 				return fmt.Errorf("failed to revert test file: %w", err)
+    1091 	// 			}
+    1092 	// 		} else {
+    1093 	// 			// Update prevProjectCoverage to the new coverageResult
+    1094 	// 			prevProjectCoverage = coverageResult
+    1095 	// 		}
+    1096 	// 	}
+    1097 	// }
+    1098 	if cfg.Lang == utgenModels.JAVA {
+    1099 		err = java.RemoveUnusedImports(cfg.RootDir)
+    1100 		if err != nil {
+    1101 			u.logger.Error("error removing unused imports", zap.Error(err))
+    1102 			return err
+    1103 		}
+    1104 	}
+    1105
+    1106 	fmt.Printf("\n<=========================================>\n")
+    1107 	fmt.Printf(("COMPLETE TEST GENERATE SUMMARY") + "\n")
+    1108 	fmt.Printf(("Total Test Summary") + "\n")
+    1109
+    1110 	fmt.Printf("+-------------------------------+-------------------------------+-------------------------------+\n")
+    1111 	fmt.Printf("| %s | %s | %s |\n",
+    1112 		centerAlignText("Total Test Cases", 29),
+    1113 		centerAlignText("Test Cases Passed", 29),
+    1114 		centerAlignText("Test Cases Failed", 29))
+    1115
+    1116 	fmt.Printf("+-------------------------------+-------------------------------+-------------------------------+\n")
+    1117 	fmt.Print(addHeightPadding(paddingHeight, 3, columnWidths3))
+    1118 	fmt.Printf("| %s | %s | %s |\n",
+    1119 		formatWithColor(centerAlignText(fmt.Sprintf("%d", totalTestCase), 29), disableAnsi, 33),
+    1120 		formatWithColor(centerAlignText(fmt.Sprintf("%d", totalPassed), 29), disableAnsi, 32),
+    1121 		formatWithColor(centerAlignText(fmt.Sprintf("%d", totalFailed+totalNoCoverage), 29), disableAnsi, 33))
+    1122 	fmt.Print(addHeightPadding(paddingHeight, 3, columnWidths3))
+    1123 	fmt.Printf("+-------------------------------+-------------------------------+-------------------------------+\n")
+    1124
+    1125 	fmt.Printf(("Discarded Cases Summary") + "\n")
+    1126 	fmt.Printf("+------------------------------------------+------------------------------------------+\n")
+    1127 	fmt.Printf("| %s | %s |\n",
+    1128 		centerAlignText("Build failures", 40),
+    1129 		centerAlignText("No Coverage output", 40))
+    1130
+    1131 	fmt.Printf("+------------------------------------------+------------------------------------------+\n")
+    1132 	fmt.Print(addHeightPadding(paddingHeight, 2, columnWidths2))
+    1133 	fmt.Printf("| %s | %s |\n",
+    1134 		formatWithColor(centerAlignText(fmt.Sprintf("%d", totalFailed), 40), disableAnsi, 35),
+    1135 		formatWithColor(centerAlignText(fmt.Sprintf("%d", totalNoCoverage), 40), disableAnsi, 92),
+    1136 	)
+    1137 	fmt.Print(addHeightPadding(paddingHeight, 2, columnWidths2))
+    1138 	fmt.Printf("+------------------------------------------+------------------------------------------+\n")
+    1139
+    1140 	fmt.Printf("<=========================================>\n")
+    1141 	return nil
+    1142 }
+    1143
+    1144 func (u *UnitTestGenerator) GetUserStats(ctx context.Context) (*ai.UTStats, error) {
+    1145 	stat, err := u.analytics.GetUserStats(ctx)
+    1146 	if err != nil {
+    1147 		u.logger.Error("Error getting user stats", zap.Error(err))
+    1148 		return nil, err
+    1149 	}
+    1150
+    1151 	u.logger.Info("User Stats", zap.Any("stats", stat))
+    1152 	return stat, nil
+    1153 }
+    1154
+    1155 var discardedTestsFilename = "session-"
+    1156
+    1157 func (u *UnitTestGenerator) saveFailedTestCasesToFile(_ context.Context, failedTests []*ai.FailedUT, nextIndex, iterationCount int) error {
+    1158 	dir, err := osGetwd123()
+    1159 	if err != nil {
+    1160 		return fmtErrorf123("error getting current directory: %w", err)
+    1161 	}
+    1162
+    1163 	newFilePath := filepathJoin123(dir, "discardedTests", fmtSprintf123("%s%d.txt", discardedTestsFilename, nextIndex))
+    1164 	fileHandle, err := osOpenFile123(newFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    1165 	if err != nil {
+    1166 		return fmtErrorf123("error opening discarded tests file: %w", err)
+    1167 	}
+    1168
+    1169 	defer func() {
+    1170 		err := fileHandle.Close()
+    1171 		if err != nil {
+    1172 			u.logger.Error("Error closing file handle", zap.Error(err))
+    1173 		}
+    1174 	}()
+    1175
+    1176 	// Write iteration count to the file
+    1177 	_, err = fileHandle.WriteString(fmtSprintf123("Iteration-%d\n", iterationCount))
+    1178 	if err != nil {
+    1179 		return fmtErrorf123("error writing iteration count to file: %w", err)
+    1180 	}
+    1181 	var builder strings.Builder
+    1182
+    1183 	// Writing Test Cases To File
+    1184 	for _, failedTest := range failedTests {
+    1185 		builder.WriteString("\n" + stringsRepeat123("-", 20) + "Test Case" + stringsRepeat123("-", 20) + "\n")
+    1186 		if len(failedTest.NewImportsCode) > 0 {
+    1187 			builder.WriteString(fmtSprintf123("Import Statements:\n%s\n", failedTest.NewImportsCode))
+    1188 		}
+    1189 		if len(failedTest.LibraryInstallationCode) > 0 {
+    1190 			builder.WriteString(fmtSprintf123("Required Library Installation\n%s\n", failedTest.LibraryInstallationCode))
+    1191 		}
+    1192 		builder.WriteString(fmtSprintf123("Test Implementation:\n%s\n\n", failedTest.TestCode))
+    1193 		if len(failedTest.ErrorMsg) > 0 {
+    1194 			builder.WriteString(fmtSprintf123("Error Message:\n%s\n", failedTest.ErrorMsg))
+    1195 		}
+    1196 		builder.WriteString(stringsRepeat123("-", 49) + "\n")
+    1197 	}
+    1198
+    1199 	_, err = fileHandle.WriteString(fmtSprintf123("%s\n", builder.String()))
+    1200 	if err != nil {
+    1201 		return fmtErrorf123("error writing to discarded tests file: %w", err)
+    1202 	}
+    1203 	return nil
+    1204 }
+    1205
+    1206 func (u *UnitTestGenerator) validateTest(ctx context.Context, cfg *utgenModels.GenerateTestCfg, inp validateTestInput, existingPackages map[string]struct{}, langSvc languageSvc.Service, coverageDeltaMap map[string]float64) (*validateTestOutput, error) {
+    1207
+    1208 	out := &validateTestOutput{
+    1209 		cov:                      inp.cov,
+    1210 		cur:                      inp.cur,
+    1211 		currProjectCoverage:      inp.prevProjectCoverage,
+    1212 		increasedProjectCoverage: make(map[string]*ai.CoverageRes),
+    1213 	}
+    1214
+    1215 	// If the language is Go, override the test command so that it runs tests only for the file's package.
+    1216 	if inp.lang == ai.GOLANG {
+    1217 		inp.testCommand = golang.BuildPackageTestCommand(ctx, u.logger, cfg, inp.srcFilePath, inp.testCommand)
+    1218 	}
+    1219
+    1220 	// Prepare test code (indentation, comments, extra code)
+    1221 	testCodeIndented := PrepareTestCode(u.logger, inp, cfg, u.langSvc)
+    1222
+    1223 	// Write test code to file
+    1224 	originalContent, err := WriteTestToFile(testCodeIndented, inp)
+    1225 	if err != nil {
+    1226 		return out, err
+    1227 	}
+    1228
+    1229 	// Handle imports and library installations
+    1230 	newInstalledPackages, importLen, err := inp.injector.HandleImportsAndLibraries(ctx, cfg, inp, langSvc, originalContent)
+    1231 	if err != nil {
+    1232 		return out, err
+    1233 	}
+    1234 	if cfg.Lang == utgenModels.GOLANG {
+    1235 		testFileContent, err := readFile(cfg.TestFilePath)
+    1236 		if err != nil {
+    1237 			return nil, fmt.Errorf("failed to read test file: %w", err)
+    1238 		}
+    1239 		linterIssues, err := u.RunGoLintOnFile(ctx, u.logger, cfg.TestFilePath, cfg.RootDir)
+    1240 		if err != nil {
+    1241 			u.logger.Error("error running go lint on file", zap.Error(err))
+    1242 		}
+    1243 		if len(linterIssues) > 0 {
+    1244 			u.logger.Warn("Linter issues found in generated test")
+    1245 			fixedCode, err := u.fixLinterIssues(ctx, inp.promptBuilder, inp.sessionID, inp.injector.language, linterIssues, testFileContent)
+    1246 			if err != nil {
+    1247 				u.logger.Error("error fixing linter issues", zap.Error(err), zap.String("file name", cfg.SrcFilePath))
+    1248 			}
+    1249 			// Write the test code to the test file
+    1250 			if err := os.WriteFile(inp.testFilePath, []byte(fixedCode), 0644); err != nil {
+    1251 				return nil, fmt.Errorf("failed to write test file: %w", err)
+    1252 			}
+    1253 		}
+    1254
+    1255 	}
+    1256
+    1257 	// Send new libraries event if needed
+    1258 	if len(newInstalledPackages) > 0 || err != nil {
+    1259 		newLibsEvent := ai.NewLibrariesEvent{
+    1260 			Iteration:  int32(inp.iterationCount),
+    1261 			TestNumber: int32(inp.testNumber),
+    1262 		}
+    1263
+    1264 		if err != nil {
+    1265 			newLibsEvent.HasError = true
+    1266 			newLibsEvent.Error = fmt.Sprintf("Error Installing Libraries: %s, please try installing %s", err.Error(), strings.Join(newInstalledPackages, ", "))
+    1267 		} else {
+    1268 			newLibsEvent.Libraries = fmt.Sprintf("New Libraries Installed: %s", strings.Join(newInstalledPackages, ", "))
+    1269 		}
+    1270
+    1271 		// sending new libraries event
+    1272 		event := ai.NewEvent(ai.NewLibraries, newLibsEvent)
+    1273 		u.logger.Info("New Libraries Event", zap.Any("event", event))
+    1274 		u.FlushData(ctx, cfg, event)
+    1275 	}
+    1276
+    1277 	// Execute the test
+    1278 	cmdOut, err := u.executeTest(ctx, cfg, inp)
+    1279 	if err != nil {
+    1280 		return out, err
+    1281 	}
+    1282
+    1283 	// Handle test execution failure
+    1284 	if cmdOut.ExitCode != 0 && (cfg.Lang != utgenModels.JAVA || cmdOut.ExitCode != 130) {
+    1285 		out.failedTest = u.handleTestFailure(ctx, cfg, inp, cmdOut, originalContent, newInstalledPackages, existingPackages)
+    1286 		out.testResult = ai.Failed
+    1287 		return out, nil
+    1288 	}
+    1289
+    1290 	// Process coverage result and determine outcome
+    1291 	err = u.processCoverageResult(ctx, cfg, inp, cmdOut, out, coverageDeltaMap)
+    1292 	if err != nil {
+    1293 		return out, err
+    1294 	}
+    1295
+    1296 	// Early return for no coverage cases
+    1297 	if out.testResult == ai.NoCoverage {
+    1298 		RevertTestChanges(u.logger, ctx, inp, originalContent, newInstalledPackages, existingPackages)
+    1299 		return out, nil
+    1300 	}
+    1301
+    1302 	// Early return for overall coverage increase cases
+    1303 	if out.testResult == ai.OverallCovInc {
+    1304 		return out, nil
+    1305 	}
+    1306
+    1307 	// Check for flakiness (only for tests that increase coverage)
+    1308 	flakyTest := u.checkFlakiness(ctx, cfg, inp, originalContent, newInstalledPackages, existingPackages)
+    1309 	if flakyTest != nil {
+    1310 		out.failedTest = flakyTest
+    1311 		out.testResult = ai.Failed
+    1312 		return out, nil
+    1313 	}
+    1314
+    1315 	// Finalize successful test
+    1316 	includeMissingPackages(existingPackages, newInstalledPackages)
+    1317 	out.testResult = ai.Passed
+    1318 	out.coverageIncreased = true
+    1319
+    1320 	testCodeLines := strings.Split(testCodeIndented, "\n")
+    1321 	u.logger.Info("Generated test passed and increased coverage")
+    1322 	out.cur.Line = inp.cur.Line + len(testCodeLines) + importLen
+    1323
+    1324 	return out, nil
+    1325 }
+    1326
+    1327 // for debug purposes
+    1328 // func printCoverageMap(reason string, coverageMap map[string]*ai.CoverageRes) {
+    1329 // 	fmt.Printf("Coverage Map: %s\n", reason)
+    1330 // 	fmt.Println("====================================================")
+    1331
+    1332 // 	for file, coverageRes := range coverageMap {
+    1333 // 		fmt.Printf("File: %s\n", file)
+    1334 // 		fmt.Printf("  Coverage: %.2f%%\n", coverageRes.Coverage*100)
+    1335 // 		fmt.Println("  Lines Covered:")
+    1336 // 		for _, line := range coverageRes.LinesCovered {
+    1337 // 			fmt.Printf("    Line %d: Hits %d\n", line.Number, line.Hits)
+    1338 // 		}
+    1339 // 		fmt.Println("  Lines Missed:")
+    1340 // 		for _, line := range coverageRes.LinesMissed {
+    1341 // 			fmt.Printf("    Line %d: Hits %d\n", line.Number, line.Hits)
+    1342 // 		}
+    1343 // 		fmt.Println("----------------------------------------------------")
+    1344 // 	}
+    1345 // 	fmt.Println("====================================================")
+    1346 // }
+    1347
+    1348 func (u *UnitTestGenerator) getCursor(ctx context.Context, promptBuilder *PromptBuilder, sessionID string, lang ai.Language, isNewTestFile bool) (*Cursor, error) {
+    1349 	cursor := &Cursor{}
+    1350
+    1351 	if isNewTestFile && (lang == ai.GOLANG) {
+    1352 		u.logger.Info("New test file detected. Using default values for golang", zap.Int("Line", 1), zap.Int("Indentation", 1))
+    1353 		cursor.Line = 1
+    1354 		cursor.Indentation = 1
+    1355 		return cursor, nil
+    1356 	}
+    1357
+    1358 	fmt.Println("Getting indentation for new Tests...")
+    1359 	indentation, err := u.getIndentation(ctx, promptBuilder, sessionID, lang)
+    1360 	if err != nil {
+    1361 		return nil, fmt.Errorf("failed to analyze test headers indentation: %w", err)
+    1362 	}
+    1363 	cursor.Indentation = indentation
+    1364
+    1365 	fmt.Println("Getting Line number for new Tests...")
+    1366
+    1367 	if lang == ai.GOLANG {
+    1368 		code := promptBuilder.Test.Code
+    1369 		// Create a new file set and parse the file including comments
+    1370 		fs := token.NewFileSet()
+    1371 		node, err := parser.ParseFile(fs, "", code, parser.AllErrors|parser.ParseComments)
+    1372 		if err != nil {
+    1373 			return nil, fmt.Errorf("failed to parse Go test file: %w", err)
+    1374 		}
+    1375
+    1376 		file := fs.File(node.Pos())
+    1377 		maxLine := 0
+    1378
+    1379 		// Check all declarations (functions, imports, etc.)
+    1380 		for _, decl := range node.Decls {
+    1381 			endLine := file.Line(decl.End())
+    1382 			if endLine > maxLine {
+    1383 				maxLine = endLine
+    1384 			}
+    1385 		}
+    1386
+    1387 		// Check all comments (including those after the last declaration)
+    1388 		for _, comment := range node.Comments {
+    1389 			endLine := file.Line(comment.End())
+    1390 			if endLine > maxLine {
+    1391 				maxLine = endLine
+    1392 			}
+    1393 		}
+    1394
+    1395 		// Fallback to package declaration if no other content
+    1396 		if maxLine == 0 {
+    1397 			maxLine = file.Line(node.End())
+    1398 		}
+    1399
+    1400 		cursor.Line = maxLine + 1
+    1401 	} else {
+    1402 		line, err := u.getLine(ctx, promptBuilder, sessionID, lang)
+    1403 		if err != nil {
+    1404 			return nil, fmt.Errorf("failed to analyze the relevant line number to insert new tests: %w", err)
+    1405 		}
+    1406 		cursor.Line = line
+    1407 	}
+    1408 	u.logger.Info("Cursor values::", zap.Int("Line", cursor.Line), zap.Int("Indentation", cursor.Indentation))
+    1409 	return cursor, nil
+    1410 }
+    1411
+    1412 func (u *UnitTestGenerator) getIndentation(ctx context.Context, promptBuilder *PromptBuilder, sessionID string, lang ai.Language) (int, error) {
+    1413 	indentation := -1
+    1414 	allowedAttempts := 3
+    1415 	counterAttempts := 0
+    1416 	for indentation == -1 && counterAttempts < allowedAttempts {
+    1417 		promptFileName := u.langSvc.FetchPromptName("indentation")
+    1418 		prompt, err := promptBuilder.BuildPrompt(promptFileName, "")
+    1419 		if err != nil {
+    1420 			return 0, fmt.Errorf("error building prompt: %w", err)
+    1421 		}
+    1422
+    1423 		aiRequest := ai.Request{
+    1424 			Prompt:    *prompt,
+    1425 			Purpose:   ai.UTG,
+    1426 			SessionID: sessionID,
+    1427 		}
+    1428 		response, err := u.api.AI(ctx, aiRequest)
+    1429 		if err != nil {
+    1430 			u.logger.Error("Error calling AI model for Indentation", zap.Error(err))
+    1431 			return 0, err
+    1432 		}
+    1433 		testsDetails, err := unmarshalYamlTestHeaders(response)
+    1434 		if err != nil {
+    1435 			u.logger.Error("Error unmarshalling test headers", zap.Error(err), zap.String("response", response))
+    1436 			return 0, err
+    1437 		}
+    1438
+    1439 		indentation, err = convertToInt(testsDetails.Indentation)
+    1440 		if err != nil {
+    1441 			return 0, fmt.Errorf("error converting test_headers_indentation to int: %w", err)
+    1442 		}
+    1443 		counterAttempts++
+    1444 	}
+    1445 	if indentation == -1 {
+    1446 		return 0, fmt.Errorf("failed to analyze the test headers indentation")
+    1447 	}
+    1448 	return indentation, nil
+    1449 }
+    1450
+    1451 func (u *UnitTestGenerator) fixLinterIssues(ctx context.Context, promptBuilder *PromptBuilder, sessionID string, lang ai.Language, linterIssues string, testFileContent string) (string, error) {
+    1452 	testCode := testFileContent
+    1453 	promptFileName := u.langSvc.FetchPromptName("fix_linter_issues")
+    1454 	promptBuilder.Test.CodeNumbered = numberLines(testCode)
+    1455 	promptBuilder.LinterIssues = linterIssues
+    1456 	prompt, err := promptBuilder.BuildPrompt(promptFileName, "")
+    1457 	if err != nil {
+    1458 		return "", fmt.Errorf("error building prompt: %w", err)
+    1459 	}
+    1460 	aiRequest := ai.Request{
+    1461 		Prompt:    *prompt,
+    1462 		Purpose:   ai.UTG,
+    1463 		SessionID: sessionID,
+    1464 	}
+    1465 	response, err := u.api.AI(ctx, aiRequest)
+    1466 	if err != nil {
+    1467 		u.logger.Error("Error calling AI model for fixing linter issues", zap.Error(err))
+    1468 		return "", err
+    1469 	}
+    1470 	fixedCode, err := getFixedCodeFromLinter(response)
+    1471 	if err != nil {
+    1472 		u.logger.Error("Error unmarshalling fixed code", zap.Error(err), zap.String("response", response))
+    1473 		return testCode, err
+    1474 	}
+    1475 	// If no fixed code is returned, return the original source code
+    1476 	if fixedCode == "" {
+    1477 		u.logger.Info("No fixed code returned, using original source code")
+    1478 		return testCode, nil
+    1479 	}
+    1480
+    1481 	// If fixed code is returned, it should be a valid Go code snippet
+    1482 	if lang == ai.GOLANG {
+    1483 		// Parse the fixed code to ensure it's valid Go code
+    1484 		_, err := parser.ParseFile(token.NewFileSet(), "", fixedCode, parser.AllErrors)
+    1485 		if err != nil {
+    1486 			return testCode, fmt.Errorf("fixed code is not valid Go code: %w", err)
+    1487 		}
+    1488 	}
+    1489 	return fixedCode, nil
+    1490 }
+    1491
+    1492 func (u *UnitTestGenerator) getLine(ctx context.Context, promptBuilder *PromptBuilder, sessionID string, lang ai.Language) (int, error) {
+    1493 	line := -1
+    1494 	allowedAttempts := 3
+    1495 	counterAttempts := 0
+    1496 	for line == -1 && counterAttempts < allowedAttempts {
+    1497 		promptFileName := u.langSvc.FetchPromptName("insert_line")
+    1498 		prompt, err := promptBuilder.BuildPrompt(promptFileName, "")
+    1499 		if err != nil {
+    1500 			return 0, fmt.Errorf("error building prompt: %w", err)
+    1501 		}
+    1502
+    1503 		aiRequest := ai.Request{
+    1504 			Prompt:    *prompt,
+    1505 			Purpose:   ai.UTG,
+    1506 			SessionID: sessionID,
+    1507 		}
+    1508 		response, err := u.api.AI(ctx, aiRequest)
+    1509 		if err != nil {
+    1510 			u.logger.Error("Error calling AI model for test generation", zap.Error(err))
+    1511 			return 0, err
+    1512 		}
+    1513 		testsDetails, err := unmarshalYamlTestLine(response)
+    1514 		if err != nil {
+    1515 			u.logger.Error("Error unmarshalling test line", zap.Error(err), zap.String("response", response))
+    1516 			return 0, err
+    1517 		}
+    1518
+    1519 		line, err = convertToInt(testsDetails.Line)
+    1520 		if err != nil {
+    1521 			return 0, fmt.Errorf("error converting relevant_line_number_to_insert_after to int: %w", err)
+    1522 		}
+    1523 		counterAttempts++
+    1524 	}
+    1525 	if line == -1 {
+    1526 		return 0, fmt.Errorf("failed to analyze the relevant line number to insert new tests")
+    1527 	}
+    1528 	return line, nil
+    1529 }
+    1530
+    1531 func (u *UnitTestGenerator) getTests(ctx context.Context, prompt *ai.Prompt, requestPurpose ai.Purpose, sessionID string, iterationCount int) (*ai.UTDetails, error) {
+    1532 	fmt.Println("Generating Tests...")
+    1533
+    1534 	initialTime := time.Now()
+    1535
+    1536 	defer func() {
+    1537 		elapsedTime := time.Since(initialTime)
+    1538 		u.logger.Info("Time taken to get tests", zap.Duration("time", elapsedTime))
+    1539 	}()
+    1540
+    1541 	select {
+    1542 	case <-ctx.Done():
+    1543 		err := ctx.Err()
+    1544 		return nil, err
+    1545 	default:
+    1546 	}
+    1547
+    1548 	aiRequest := ai.Request{
+    1549 		Prompt:    *prompt,
+    1550 		SessionID: sessionID,
+    1551 		Iteration: iterationCount,
+    1552 		Purpose:   requestPurpose,
+    1553 	}
+    1554
+    1555 	response, err := u.api.AI(ctx, aiRequest)
+    1556 	if err != nil {
+    1557 		u.logger.Error("Error calling AI model for test generation", zap.Error(err))
+    1558 		return nil, err
+    1559 	}
+    1560
+    1561 	testsDetails, err := unmarshalYamlTestDetails(u.logger, response)
+    1562 	if err != nil {
+    1563 		u.logger.Error("Error unmarshalling test details", zap.Error(err), zap.String("response", response))
+    1564 		return nil, err
+    1565 	}
+    1566
+    1567 	return testsDetails, nil
+    1568 }
+    1569
+    1570 // GetFolderStructure implements Service.
+    1571 func (u *UnitTestGenerator) GetFolderStructure() {
+    1572 	panic("unimplemented")
+    1573 }
+    1574
+    1575 // GetFunction implements Service.
+    1576 func (u *UnitTestGenerator) GetFunction() {
+    1577 	panic("unimplemented")
+    1578 }
+    1579
+    1580 // RunTest implements Service.
+    1581 func (u *UnitTestGenerator) RunTest() {
+    1582 	panic("unimplemented")
+    1583 }
+    1584
+    1585 func (u *UnitTestGenerator) FlushData(ctx context.Context, cfg *ai.GenerateTestCfg, data interface{}) {
+    1586 	if cfg == nil || cfg.EventChannel == nil {
+    1587 		return
+    1588 	}
+    1589 	select {
+    1590 	case cfg.EventChannel <- data:
+    1591 		// Data sent successfully
+    1592 	case <-ctx.Done():
+    1593 		u.logger.Warn("Context cancelled while attempting to send event data")
+    1594 		return
+    1595 	}
+    1596 }
+    1597 func (u *UnitTestGenerator) processRefactoringAndMocks(ctx context.Context, logger *zap.Logger, cfg *ai.GenerateTestCfg, promptBuilder *PromptBuilder, injector *Injector, sessionID string) error {
+    1598 	switch cfg.Lang {
+    1599 	case ai.GOLANG:
+    1600 		return u.handleRefactorAndMock(ctx, logger, cfg, promptBuilder, injector, sessionID)
+    1601 	case ai.JAVA:
+    1602 		logger.Info("Java refactoring and mock generation not implemented yet")
+    1603 		return nil
+    1604 	default:
+    1605 		logger.Info("No refactoring or mock processing required for this language", zap.String("language", string(cfg.Lang)))
+    1606 	}
+    1607 	return nil
+    1608 }
+    1609 func (u *UnitTestGenerator) processCommentSanitization(ctx context.Context, logger *zap.Logger, cfg *ai.GenerateTestCfg, promptBuilder *PromptBuilder, sessionID string) error {
+    1610 	switch cfg.Lang {
+    1611 	case utgenModels.GOLANG:
+    1612 		return u.handleCommentSanitization(ctx, logger, cfg, promptBuilder, sessionID)
+    1613
+    1614 	default:
+    1615 		logger.Info("No comment sanitization required for this language", zap.String("language", string(cfg.Lang)))
+    1616 	}
+    1617 	return nil
+    1618 }
+    1619
+    1620 // TODO: should move to go specific file along with refactor handleRefactorAndMock
+    1621 func (u *UnitTestGenerator) handleCommentSanitization(ctx context.Context, logger *zap.Logger, cfg *utgenModels.GenerateTestCfg, promptBuilder *PromptBuilder, sessionID string) error {
+    1622 	sourceCode := promptBuilder.Src.Code
+    1623
+    1624 	if !needsCommentCleaning(sourceCode, 50) {
+    1625 		logger.Info("Skipping AI comment cleaning due to insufficient commented lines")
+    1626 		return nil
+    1627 	}
+    1628 	cleanedCode, err := u.getCleanedSource(ctx, promptBuilder, sessionID)
+    1629 	if err != nil {
+    1630 		logger.Warn("Failed to clean comments using AI", zap.Error(err))
+    1631 		return nil // Proceed even if sanitization fails
+    1632 	}
+    1633 	if cleanedCode != "" {
+    1634 		cleanedCode, err = removeComments(u.logger, cleanedCode, cfg.SrcFilePath)
+    1635
+    1636 		if err != nil {
+    1637 			logger.Warn("Error removing comments from source code", zap.Error(err))
+    1638 			return err
+    1639 		}
+    1640
+    1641 		promptBuilder.Src.Code = cleanedCode
+    1642 		logger.Info("Successfully replaced source with AI-cleaned version")
+    1643 	}
+    1644 	return nil
+    1645 }
+    1646
+    1647 func (u *UnitTestGenerator) getCleanedSource(ctx context.Context, promptBuilder *PromptBuilder, sessionID string) (string, error) {
+    1648 	promptFileName := u.langSvc.FetchPromptName("comment_sanitizer")
+    1649 	prompt, err := promptBuilder.BuildPrompt(promptFileName, "")
+    1650 	if err != nil {
+    1651 		u.logger.Error("Error building prompt", zap.Error(err))
+    1652 		return "", err
+    1653 	}
+    1654 	cleanedCode, err := u.getRefactorPatch(ctx, prompt, ai.CleanComments, sessionID, 1)
+    1655 	if err != nil {
+    1656 		u.logger.Warn("Error cleaning comments via AI, using original source", zap.Error(err))
+    1657 		return "", err
+    1658 	}
+    1659 	return cleanedCode, nil
+    1660 }
+    1661
+    1662 // Function to refactor source code
+    1663 func (u *UnitTestGenerator) refactorSourceCode(ctx context.Context, logger *zap.Logger, cfg *ai.GenerateTestCfg, promptBuilder *PromptBuilder, sessionID string) (string, error) {
+    1664 	promptFileName := u.langSvc.FetchPromptName("refactor_file")
+    1665 	prompt, err := promptBuilder.BuildPrompt(promptFileName, "")
+    1666 	if err != nil {
+    1667 		u.logger.Error("Error building prompt", zap.Error(err))
+    1668 		return "", err
+    1669 	}
+    1670
+    1671 	moduleName, _ := u.langSvc.GetModuleName(cfg.SrcFilePath, cfg.RootDir)
+    1672 	refactorPatch, err := u.getRefactorPatch(ctx, prompt, ai.Refactor, sessionID, 1)
+    1673 	if err != nil {
+    1674 		logger.Warn("Failed to get refactor patch", zap.Error(err))
+    1675 	} else if refactorPatch != "" {
+    1676 		err = applyRefactorPatchJSON(ctx, logger, refactorPatch, cfg.SrcFilePath, cfg.TestCommand, cfg.RootDir)
+    1677 		if err != nil {
+    1678 			logger.Warn("Failed to apply refactor patch", zap.Error(err))
+    1679 		} else {
+    1680 			err = golang.RunMockery(ctx, logger, cfg, nil, moduleName)
+    1681 			if err != nil {
+    1682 				logger.Error("Error running mockery without refactor patch", zap.Error(err))
+    1683 				return "", err
+    1684 			}
+    1685 		}
+    1686 	}
+    1687 	return moduleName, nil
+    1688 }
+    1689
+    1690 // Function to handle Go-specific refactoring and mock generation
+    1691 func (u *UnitTestGenerator) handleRefactorAndMock(ctx context.Context, logger *zap.Logger, cfg *ai.GenerateTestCfg, promptBuilder *PromptBuilder, injector *Injector, sessionID string) error {
+    1692 	moduleName, err := u.refactorSourceCode(ctx, logger, cfg, promptBuilder, sessionID)
+    1693 	if err != nil {
+    1694 		return err
+    1695 	}
+    1696
+    1697 	err = u.langSvc.GenerateMock(ctx, cfg, moduleName)
+    1698 	return err
+    1699 }
+    1700
+    1701 func (u *UnitTestGenerator) getRefactorPatch(ctx context.Context, prompt *ai.Prompt, requestPurpose ai.Purpose, sessionID string, iterationCount int) (string, error) {
+    1702
+    1703 	select {
+    1704 	case <-ctx.Done():
+    1705 		err := ctx.Err()
+    1706 		return "", err
+    1707 	default:
+    1708 	}
+    1709
+    1710 	aiRequest := ai.Request{
+    1711 		Prompt:    *prompt,
+    1712 		SessionID: sessionID,
+    1713 		Iteration: iterationCount,
+    1714 		Purpose:   requestPurpose,
+    1715 	}
+    1716
+    1717 	response, err := u.api.AI(ctx, aiRequest)
+    1718 	if err != nil {
+    1719 		u.logger.Error("Error calling AI model for refactoring", zap.Error(err))
+    1720 		return "AI call failied", err
+    1721 	}
+    1722
+    1723 	return response, nil
+    1724 }
+    1725
+    1726 func (u *UnitTestGenerator) RunGoLintOnFile(ctx context.Context, logger *zap.Logger, filePath string, rootPath string) (string, error) {
+    1727 	cmd := execCommandContext123(ctx, "golint", filePath)
+    1728
+    1729 	var outBuf bytes.Buffer
+    1730 	cmd.Stdout = &outBuf
+    1731 	cmd.Stderr = &outBuf
+    1732 	cmd.Dir = rootPath
+    1733
+    1734 	err := cmd.Run()
+    1735 	if err != nil {
+    1736 		logger.Warn("golint execution returned non-zero exit", zap.Error(err))
+    1737 	}
+    1738
+    1739 	output := outBuf.String()
+    1740 	if output != "" {
+    1741 		return output, nil
+    1742 	}
+    1743
+    1744 	return "", nil // No issues
+    1745 }
+    1746
+    1747 func (u *UnitTestGenerator) installSpecificJavaVersion(ctx context.Context, logger *zap.Logger, promptBuilder *PromptBuilder, sessionId string, rootDir string) error {
+    1748 	pomPath := filepath.Join(rootDir, "pom.xml")
+    1749 	pomContent, err := os.ReadFile(pomPath)
+    1750 	if err != nil {
+    1751 		logger.Error("Failed to read pom.xml", zap.String("path", pomPath), zap.Error(err))
+    1752 		return err
+    1753 	}
+    1754
+    1755 	var version string
+    1756 	version, found, err := java.DetectVersionFromPOMFile(pomPath)
+    1757 	if err != nil {
+    1758 		return err
+    1759 	}
+    1760 	if !found {
+    1761 		// ask AI what can be the version
+    1762 		promptBuilder.PomXML = string(pomContent)
+    1763 		promptFileName := u.langSvc.FetchPromptName("java_version")
+    1764 		prompt, err := promptBuilder.BuildPrompt(promptFileName, "")
+    1765 		if err != nil {
+    1766 			logger.Error("Error building prompt", zap.Error(err))
+    1767 			return err
+    1768 		}
+    1769
+    1770 		// need another function for the same
+    1771 		versionYaml, err := u.getRefactorPatch(ctx, prompt, ai.UTG, sessionId, 1)
+    1772 		if err != nil {
+    1773 			logger.Error("Error getting java version", zap.Error(err))
+    1774 			return err
+    1775 		}
+    1776 		version = strings.TrimSpace(strings.TrimPrefix(versionYaml, "version:"))
+    1777 	}
+    1778 	return java.InstallVersionWithSDKMan(ctx, logger, version, rootDir)
+    1779 }
+    1780
+    1781 // executeTest runs the test command and returns the command output
+    1782 func (u *UnitTestGenerator) executeTest(ctx context.Context, cfg *utgenModels.GenerateTestCfg, inp validateTestInput) (*ai.CommandOutput, error) {
+    1783 	u.logger.Debug(fmt.Sprintf("Running Test with command: '%s'", inp.testCommand))
+    1784 	ctxWithTimeout, cancel := context.WithTimeout(ctx, 30*time.Second)
+    1785 	defer cancel()
+    1786 	testRunEvent := ai.TestRunEvent{
+    1787 		Iteration:  int32(inp.iterationCount),
+    1788 		RunCommand: inp.testCommand,
+    1789 		TestNumber: int32(inp.testNumber),
+    1790 	}
+    1791
+    1792 	// sending test run event
+    1793 	event := ai.NewEvent(ai.TestRun, testRunEvent)
+    1794 	u.logger.Info("Test Run Event", zap.Any("event", event))
+    1795 	u.FlushData(ctx, cfg, event)
+    1796
+    1797 	var cmdOut ai.CommandOutput
+    1798 	if runtime.GOOS == "windows" && inp.lang == ai.GOLANG {
+    1799 		cmdOut, _ = util.RunGoTestonWindows(ctxWithTimeout, u.logger, inp.testCommand, inp.rootDir)
+    1800 	} else {
+    1801 		cmdOut, _ = util.RunCommand(ctxWithTimeout, u.logger, inp.testCommand, inp.rootDir)
+    1802 	}
+    1803
+    1804 	return &cmdOut, nil
+    1805 }
+    1806
+    1807 // handleTestFailure processes test execution failures
+    1808 func (u *UnitTestGenerator) handleTestFailure(ctx context.Context, cfg *utgenModels.GenerateTestCfg, inp validateTestInput, cmdOut *ai.CommandOutput, originalContent string, newInstalledPackages []string, existingPackages map[string]struct{}) *ai.FailedUT {
+    1809 	testRunStateEvent := ai.TestRunFailureEvent{
+    1810 		Iteration:  int32(inp.iterationCount),
+    1811 		TestNumber: int32(inp.testNumber),
+    1812 		Error:      extractErrorMessage(u.logger, cmdOut.Stdout, cmdOut.Stderr, u.langSvc),
+    1813 	}
+    1814
+    1815 	// sending test run status event
+    1816 	event := ai.NewEvent(ai.TestRunFailure, testRunStateEvent)
+    1817 	u.logger.Info("Test Run Status Event", zap.Any("event", event))
+    1818 	u.FlushData(ctx, cfg, event)
+    1819
+    1820 	u.logger.Info("Test Run Failed")
+    1821
+    1822 	RevertTestChanges(u.logger, ctx, inp, originalContent, newInstalledPackages, existingPackages)
+    1823
+    1824 	// Mark test as failed
+    1825 	return &ai.FailedUT{
+    1826 		TestCode:                inp.generatedTest.TestCode,
+    1827 		CompleteError:           cmdOut.Stderr,
+    1828 		ErrorMsg:                extractErrorMessage(u.logger, cmdOut.Stdout, cmdOut.Stderr, u.langSvc),
+    1829 		NewImportsCode:          inp.generatedTest.NewImportsCode,
+    1830 		LibraryInstallationCode: inp.generatedTest.LibraryInstallationCode,
+    1831 	}
+    1832 }
+    1833
+    1834 // processCoverageResult analyzes coverage and determines test outcome
+    1835 func (u *UnitTestGenerator) processCoverageResult(ctx context.Context, cfg *utgenModels.GenerateTestCfg, inp validateTestInput, cmdOut *ai.CommandOutput, out *validateTestOutput, coverageDeltaMap map[string]float64) error {
+    1836 	// Process the coverage report
+    1837 	coverageProcessor := coverageSvc.NewCoverageProcessor(inp.rootDir, inp.cov.Path, inp.srcFilePath, inp.cov.Format, inp.moduleName)
+    1838 	coverageResult, content, err := coverageProcessor.ProcessCoverageReport(cmdOut.StartTime)
+    1839 	if err != nil {
+    1840 		u.logger.Error("Error in coverage processing", zap.Error(err))
+    1841 		return fmt.Errorf("error in coverage processing: %w", err)
+    1842 	}
+    1843
+    1844 	if coverageResult == nil {
+    1845 		u.logger.Info("No coverage report generated")
+    1846 		out.testResult = ai.NoCoverage
+    1847 		return nil
+    1848 	}
+    1849 	// check if overAll coverage increased.
+    1850 	incCov, overallCovInc, err := coverageSvc.GetIncreasedCoverage(inp.prevProjectCoverage, coverageResult)
+    1851 	if err != nil {
+    1852 		u.logger.Error("Error getting increased coverage", zap.Error(err))
+    1853 		overallCovInc = false
+    1854 	}
+    1855 	initialCoverage := inp.cov.Current
+    1856 	out.cov.Current = coverageResult[inp.srcFilePath].Coverage
+    1857 	out.cov.Content = content
+    1858
+    1859 	coverageIncreased := out.cov.Current > initialCoverage
+    1860 	switch {
+    1861 	case !coverageIncreased && !overallCovInc:
+    1862 		out.testResult = ai.NoCoverage
+    1863 		u.logger.Info("No coverage increase detected after initial test run.")
+    1864 		return nil
+    1865 	case !coverageIncreased && overallCovInc:
+    1866 		out.testResult = ai.OverallCovInc
+    1867 		// merge the prev coverage with the current coverage
+    1868 		mergedCoverage, err := coverageProcessor.MergeCoverage(inp.prevProjectCoverage, coverageResult)
+    1869 		if err != nil {
+    1870 			u.logger.Error("Error merging coverage", zap.Error(err))
+    1871 			return fmt.Errorf("error merging coverage: %w", err)
+    1872 		}
+    1873 		out.currProjectCoverage = mergedCoverage
+    1874
+    1875 		if cfg.Lang == utgenModels.GOLANG {
+    1876 			testName := u.langSvc.ExtractTestFunctionName(inp.generatedTest.TestCode)
+    1877 			delta := coverageSvc.GetCoveragePercentage(mergedCoverage, cfg.Lang) - coverageSvc.GetCoveragePercentage(inp.prevProjectCoverage, cfg.Lang)
+    1878 			coverageDeltaMap[testName] = delta
+    1879 			u.logger.Info("Recorded coverage delta for test overall",
+    1880 				zap.String("testName", testName),
+    1881 				zap.Float64("delta", delta),
+    1882 			)
+    1883 		}
+    1884
+    1885 		if incCov != nil {
+    1886 			out.increasedProjectCoverage = incCov
+    1887 		}
+    1888 		u.logger.Info("Coverage increased in the project but not for the file under test.")
+    1889 		return nil
+    1890 	case coverageIncreased:
+    1891 		if !overallCovInc {
+    1892 			return fmt.Errorf("not possible to have coverage increased for the file under test without increasing the overall coverage")
+    1893 		}
+    1894 		// merge the prev coverage with the current coverage
+    1895 		mergedCoverage, err := coverageProcessor.MergeCoverage(inp.prevProjectCoverage, coverageResult)
+    1896 		if err != nil {
+    1897 			u.logger.Error("Error merging coverage", zap.Error(err))
+    1898 			return fmt.Errorf("error merging coverage: %w", err)
+    1899 		}
+    1900
+    1901 		if incCov != nil {
+    1902 			out.increasedProjectCoverage = incCov
+    1903 		}
+    1904
+    1905 		out.currProjectCoverage = mergedCoverage
+    1906 		if cfg.Lang == utgenModels.GOLANG {
+    1907 			testName := u.langSvc.ExtractTestFunctionName(inp.generatedTest.TestCode)
+    1908 			delta := coverageSvc.GetCoveragePercentage(mergedCoverage, cfg.Lang) - coverageSvc.GetCoveragePercentage(inp.prevProjectCoverage, cfg.Lang)
+    1909 			coverageDeltaMap[testName] = delta
+    1910 			u.logger.Info("Recorded coverage delta for test",
+    1911 				zap.String("testName", testName),
+    1912 				zap.Float64("delta", delta),
+    1913 			)
+    1914 		}
+    1915 		u.logger.Info("Coverage increased for the file under test.")
+    1916 	}
+    1917
+    1918 	return nil
+    1919 }
+    1920
+    1921 // checkFlakiness runs multiple test iterations to detect flaky tests
+    1922 func (u *UnitTestGenerator) checkFlakiness(ctx context.Context, cfg *utgenModels.GenerateTestCfg, inp validateTestInput, originalContent string, newInstalledPackages []string, existingPackages map[string]struct{}) *ai.FailedUT {
+    1923 	if !inp.checkFlakiness {
+    1924 		return nil
+    1925 	}
+    1926
+    1927 	// Run the Test Five Times to Check for Flakiness
+    1928 	u.logger.Info("Coverage increased. Running additional test iterations to check for flakiness.")
+    1929 	for i := 0; i < 5; i++ {
+    1930 		u.logger.Info(fmt.Sprintf("Flakiness Check - Iteration no: %d", i+1))
+    1931 		ctxWithTimeout, cancel := context.WithTimeout(ctx, 5*time.Second)
+    1932 		defer cancel()
+    1933 		cmdOut, _ := util.RunCommand(ctxWithTimeout, u.logger, inp.testCommand, inp.rootDir)
+    1934 		if cmdOut.ExitCode != 0 {
+    1935 			u.logger.Info(fmt.Sprintf("Flaky test detected on iteration %d: %s", i+1, cmdOut.Stderr))
+    1936
+    1937 			RevertTestChanges(u.logger, ctx, inp, originalContent, newInstalledPackages, existingPackages)
+    1938
+    1939 			return &ai.FailedUT{
+    1940 				TestCode:                inp.generatedTest.TestCode,
+    1941 				CompleteError:           cmdOut.Stderr,
+    1942 				ErrorMsg:                extractErrorMessage(u.logger, cmdOut.Stdout, cmdOut.Stderr, u.langSvc),
+    1943 				NewImportsCode:          inp.generatedTest.NewImportsCode,
+    1944 				LibraryInstallationCode: inp.generatedTest.LibraryInstallationCode,
+    1945 			}
+    1946 		}
+    1947 	}
+    1948 	return nil
+    1949 }
+    1950
+    =========
+    
+    
+    ### Below are the line changes from the PR , Write test cases to ensure these lines are adequately covered:
+    - **Lines 4 to 4**
+    - **Lines 13 to 13**
+    - **Lines 806 to 807**
+    - **Lines 1207 to 1228**
+    - **Lines 1424 to 1464**
+    - **Lines 1699 to 1719**
+    
+    =========
+    Here is the file that contains the existing tests, called `/var/folders/p2/8fbl_ngs52l2mzvzcyr5q9b40000gn/T/repo-replica-enterprise-2251116249/pkg/service/utgenv2/gen_test.go`.
+    package utgenv2
+    
+    import (
+    "os"
+    "testing"
+    
+    "context"
+    
+    "time"
+    
+    aiModels "github.com/keploy/enterprise/pkg/models/ai"
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/require"
+    "go.uber.org/zap"
+    )
+    
+    // TestHandleGoLangCommentSanitization_SkipCleaning_207 tests skipping comment cleaning.
+    func TestHandleGoLangCommentSanitization_SkipCleaning_207(t *testing.T) {
+    logger := zap.NewNop()
+    uut := &UnitTestGenerator{logger: logger}
+    promptBuilder := &PromptBuilder{
+    Src: &Source{Code: "package main\nfunc main() {\n// A single comment\n}"}, // Few comments
+    }
+    cfg := &aiModels.GenerateTestCfg{Lang: aiModels.GOLANG}
+    
+    err := uut.handleCommentSanitization(context.Background(), logger, cfg, promptBuilder, "session-id")
+    require.NoError(t, err)
+    // Assert that source code in promptBuilder remains unchanged.
+    assert.Equal(t, "package main\nfunc main() {\n// A single comment\n}", promptBuilder.Src.Code)
+    }
+    
+    // TestProcessCommentSanitization_NonGoLang_206 tests processCommentSanitization for non-Go languages.
+    func TestProcessCommentSanitization_NonGoLang_206(t *testing.T) {
+    logger := zap.NewNop()
+    uut := &UnitTestGenerator{logger: logger}
+    cfg := &aiModels.GenerateTestCfg{
+    Lang: aiModels.PYTHON, // Any non-Go language
+    }
+    err := uut.processCommentSanitization(context.Background(), logger, cfg, nil, "session-id")
+    require.NoError(t, err)
+    }
+    
+    // TestGetRefactorPatch_ContextCancelled_210 tests getRefactorPatch when context is cancelled.
+    func TestGetRefactorPatch_ContextCancelled_210(t *testing.T) {
+    logger := zap.NewNop()
+    uut := &UnitTestGenerator{logger: logger}
+    ctx, cancel := context.WithCancel(context.Background())
+    cancel() // Cancel immediately
+    
+    _, err := uut.getRefactorPatch(ctx, &aiModels.Prompt{}, aiModels.Refactor, "session-id", 1)
+    require.Error(t, err)
+    assert.ErrorIs(t, err, context.Canceled)
+    }
+    
+    // TestProcessRefactoringAndMocks_NonGoLang_205 tests processRefactoringAndMocks for non-Go languages.
+    func TestProcessRefactoringAndMocks_NonGoLang_205(t *testing.T) {
+    logger := zap.NewNop()
+    uut := &UnitTestGenerator{logger: logger}
+    cfg := &aiModels.GenerateTestCfg{
+    Lang: aiModels.JAVASCRIPT, // Any non-Go language
+    }
+    // No mocks needed as it should short-circuit for non-Go.
+    err := uut.processRefactoringAndMocks(context.Background(), logger, cfg, nil, nil, "session-id")
+    require.NoError(t, err)
+    }
+    
+    // TestExecute_CommandFailure_002 tests the Execute method when util.RunCommand returns an error.
+    func TestExecute_CommandFailure_002(t *testing.T) {
+    // Arrange
+    logger := zap.NewNop()
+    utg := &UnitTestGenerator{
+    logger: logger,
+    }
+    req := &ExecuteRequest{
+    Command: "a_command_that_should_not_exist_anywhere_ever", // This command should fail
+    Dir:     os.TempDir(),
+    }
+    
+    // Act
+    resp, err := utg.Execute(context.Background(), req)
+    
+    // Assert
+    require.Error(t, err) // Expect an error because the command is invalid
+    assert.Nil(t, resp)
+    // The exact error message might depend on the OS and shell,
+    // so checking for a general error is sufficient.
+    // If util.RunCommand wraps the error, check for that specific wrapped error type if applicable.
+    }
+    
+    // TestFlushData_NilCfg_201 tests FlushData with a nil configuration.
+    func TestFlushData_NilCfg_201(t *testing.T) {
+    uut := &UnitTestGenerator{logger: zap.NewNop()}
+    // Should not panic or error, just return.
+    uut.FlushData(context.Background(), nil, "test data")
+    }
+    
+    // TestFlushData_ContextCancelled_204 tests FlushData when context is cancelled.
+    func TestFlushData_ContextCancelled_204(t *testing.T) {
+    uut := &UnitTestGenerator{logger: zap.NewNop()}
+    // Unbuffered channel to ensure send blocks if context is not checked first
+    eventChan := make(chan interface{})
+    cfg := &aiModels.GenerateTestCfg{
+    EventChannel: eventChan,
+    }
+    ctx, cancel := context.WithCancel(context.Background())
+    cancel() // Cancel context immediately
+    
+    // This call should return because context is cancelled, not block on sending.
+    uut.FlushData(ctx, cfg, "test data")
+    
+    // No assertion needed other than it doesn't deadlock and returns.
+    // We can check logs if specific warning is expected, but not strictly necessary for coverage.
+    }
+    
+    // TestFlushData_Success_203 tests successful data sending via FlushData.
+    func TestFlushData_Success_203(t *testing.T) {
+    uut := &UnitTestGenerator{logger: zap.NewNop()}
+    eventChan := make(chan interface{}, 1)
+    cfg := &aiModels.GenerateTestCfg{
+    EventChannel: eventChan,
+    }
+    testData := "hello world"
+    
+    uut.FlushData(context.Background(), cfg, testData)
+    
+    select {
+    case dataReceived := <-eventChan:
+    assert.Equal(t, testData, dataReceived)
+    case <-time.After(1 * time.Second):
+    t.Fatal("timed out waiting for data on event channel")
+    }
+    }
+    // end of file
+    =========
